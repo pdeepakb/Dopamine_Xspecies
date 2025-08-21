@@ -1,0 +1,11 @@
+raw_data/*
+*.xlsx
+.Rproj.user/
+*.Rproj
+.Rhistory
+.RData
+*.rds
+*.png
+*.csv
+scnuclei_reanalysis.v1_files/
+*.html

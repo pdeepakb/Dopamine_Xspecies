@@ -1,0 +1,872 @@
+---
+title: "Dopamine MSNs Epigenetic Analysis"
+author: "Deepak Poduval"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 10, fig.height = 8)
+library(Seurat)            # Core package for single-cell RNA-seq analysis
+library(clusterProfiler)  # Functional enrichment analysis (GO, KEGG pathways, etc.)
+library(org.Hs.eg.db)     # Human genome annotation database (for gene ID conversion and enrichment)
+library(tidyverse)        # Collection of R packages for data manipulation and visualization (e.g., dplyr, readr)
+library(patchwork)        # For combining multiple ggplot2 plots into a single figure
+library(Matrix)           # Sparse and dense matrix operations, efficient for scRNA-seq data
+library(ggplot2)          # Data visualization using the grammar of graphics
+library(enrichplot)       # Visualization tools for enrichment results
+library(edgeR)            # Differential expression analysis using pseudobulk data
+library(ggrepel)          # For smart, non-overlapping text labels in ggplot2 plots
+
+
+# Create output directories
+dir.create("figures", showWarnings = FALSE)
+dir.create("tables", showWarnings = FALSE)
+```
+
+## Load and Initial Data Exploration
+
+```{r load_data}
+# Load the RDS file
+so <- readRDS("raw_data/GSE167920_Results_full_nuclei_processed_final.rds")
+
+# Explore data structure
+print("Data Overview")
+print(paste("Number of cells:", ncol(so)))
+print(paste("Number of genes:", nrow(so)))
+print(paste("Available assays:", paste(names(so@assays), collapse = ", ")))
+
+# Check metadata
+print("Metadata Columns")
+print(colnames(so@meta.data))
+
+# Check cell types
+if("cell_type" %in% colnames(so@meta.data)) {
+  print("Cell Type Distribution")
+  print(table(so@meta.data$cell_type))
+}
+
+# Check for D1/D2 MSN populations
+#Medium spiny neurons (MSNs), the predominant striatal cell type, are mainly D1- and D2-MSNs. D1-MSNs express dopamine receptor 1 (DRD1), while D2-MSNs express dopamine receptor 2 (DRD2).
+
+print("Checking For D1/D2 MSNs")
+msn_types <- grep("DRD|D1|D2|MSN", unique(so@meta.data$cell_type), value = TRUE, ignore.case = TRUE)
+print(paste("MSN-related cell types found:", paste(msn_types, collapse = ", ")))
+
+# Basic data structure
+str(so@meta.data, max.level = 1)
+```
+
+## Quality Control Assessment
+
+```{r qc_assessment}
+# Clear any problematic graph objects first
+so@graphs <- list()
+
+# Check actual column names in metadata
+print("Actual Meta Data Columns")
+print(colnames(so@meta.data))
+
+# Calculate additional QC metrics if not present
+if(!"percent.mt" %in% colnames(so@meta.data)) {
+  so[["percent.mt"]] <- PercentageFeatureSet(so, pattern = "^MT-")
+}
+
+# percent.ribo already exists, but let's check the pattern used
+if(!"percent.ribo" %in% colnames(so@meta.data)) {
+  so[["percent.ribo"]] <- PercentageFeatureSet(so, pattern = "^RP[SL]")
+}
+
+# QC visualization using correct column names
+print("QC Metrics Summary")
+summary(so@meta.data$nFeatures_RNA)  
+summary(so@meta.data$nCount.RNA)     
+summary(so@meta.data$percent.ribo)
+
+# QC plots with correct column names
+p1 <- VlnPlot(so, features = c("nFeatures_RNA", "nCount.RNA", "percent.ribo"), ncol = 3, pt.size = 0.1)
+print(p1)
+ggsave("figures/QC_violin_plots.png", p1, width = 15, height = 6)
+
+# Feature scatter plots with correct names
+p2 <- FeatureScatter(so, feature1 = "nCount.RNA", feature2 = "nFeatures_RNA") +
+  geom_smooth(method = "lm")
+p3 <- FeatureScatter(so, feature1 = "nCount.RNA", feature2 = "percent.ribo") +
+  geom_smooth(method = "lm")
+p4 <- p2 + p3
+print(p4)
+ggsave("figures/QC_scatter_plots.png", p4, width = 12, height = 6)
+```
+
+## Data Filtering and Quality Control
+
+```{r filtering}
+print("Before Filtering")
+print(paste("Cells:", ncol(so)))
+print(paste("Genes:", nrow(so)))
+
+# Check cell type distribution before filtering
+if("cell_type" %in% colnames(so@meta.data)) {
+  print("Cell Type Distribution Before Filtering")
+  print(table(so@meta.data$cell_type))
+}
+
+# Apply filtering based on QC metrics
+so <- subset(so, subset = nFeatures_RNA > 200 & 
+                          nFeatures_RNA < 8000 & 
+                          nCount.RNA > 1000 & 
+                          nCount.RNA < 80000 & 
+                          percent.ribo < 0.02)
+
+print("After Filtering")
+print(paste("Cells:", ncol(so)))
+print(paste("Genes:", nrow(so)))
+
+# Check cell type distribution after filtering
+if("cell_type" %in% colnames(so@meta.data)) {
+  print("Cell Type Distribution After Filtering")
+  print(table(so@meta.data$cell_type))
+}
+```
+
+## Data Normalization and Scaling
+
+```{r normalize_scale}
+# Set default assay and normalize
+DefaultAssay(so) <- "RNA"
+
+# Check if data is already normalized
+if (is.null(so[["RNA"]]@data) || ncol(so[["RNA"]]@data) == 0) {
+  print("Normalizing RNA data...")
+  so <- NormalizeData(so)
+} else {
+  print("RNA data already normalized")
+}
+
+# Find variable features
+if(length(VariableFeatures(so)) == 0) {
+  print("Finding variable features...")
+  so <- FindVariableFeatures(so, selection.method = "vst", nfeatures = 2000)
+} else {
+  print("Variable features already identified")
+}
+
+# Plot variable features
+top10 <- head(VariableFeatures(so), 10)
+p5 <- VariableFeaturePlot(so)
+p6 <- LabelPoints(plot = p5, points = top10, repel = TRUE)
+print(p6)
+ggsave("figures/Variable_Features.png", p6, width = 12, height = 8)
+
+# Scale data
+if (is.null(so[["RNA"]]@scale.data) || ncol(so[["RNA"]]@scale.data) == 0) {
+  print("Scaling RNA data...")
+  so <- ScaleData(so)
+} else {
+  print("RNA data already scaled")
+}
+
+```
+
+## PCA and Dimensionality Reduction
+
+```{r pca_umap}
+# Run PCA if not already done
+if(!"pca" %in% names(so@reductions)) {
+  print("Running PCA...")
+  so <- RunPCA(so, features = VariableFeatures(so))
+}
+
+# PCA visualization
+p7 <- DimPlot(so, reduction = "pca", group.by = "cell_type", label = TRUE, repel = TRUE)
+print(p7)
+ggsave("figures/PCA_plot.png", p7, width = 12, height = 8)
+
+# Elbow plot to determine dimensions
+p8 <- ElbowPlot(so, ndims = 50)
+print(p8)
+ggsave("figures/Elbow_plot.png", p8, width = 10, height = 6)
+
+# Run UMAP if not already done
+if(!"umap" %in% names(so@reductions)) {
+  print("Running UMAP...")
+  so <- RunUMAP(so, dims = 1:20)
+}
+
+# UMAP visualization
+p9 <- DimPlot(so, reduction = "umap", group.by = "cell_type", label = TRUE, repel = TRUE)
+print(p9)
+ggsave("figures/UMAP_CellType.png", p9, width = 12, height = 10)
+```
+
+## Dopamine Receptor Expression Analysis
+
+```{r dopamine_receptors}
+# Key dopamine-related markers
+#dopamine_markers <- c("DRD1", "DRD2", "PDYN", "PENK", "TAC1", "ADORA2A", "PPP1R1B", "PDE1B", "BCL11B", "KIAA1211L", "PDE2A", "SLIT3", "NGEF" )
+#PDYN, PENK and TAC1 did not have enough expression
+dopamine_markers <- c("DRD1", "DRD2", "PPP1R1B", "PDE1B", "BCL11B", "KIAA1211L", "PDE2A", "SLIT3", "NGEF" )
+
+# Check which markers are present in the data
+present_markers <- dopamine_markers[dopamine_markers %in% rownames(so)]
+missing_markers <- dopamine_markers[!dopamine_markers %in% rownames(so)]
+
+print("Dopamine Marker Availability")
+print(paste("Present:", paste(present_markers, collapse = ", ")))
+print(paste("Missing:", paste(missing_markers, collapse = ", ")))
+
+# Feature plots for dopamine markers
+if(length(present_markers) > 0) {
+  p10 <- FeaturePlot(so, features = present_markers, ncol = 3, reduction = "umap")
+  print(p10)
+  ggsave("figures/Dopamine_Markers_FeaturePlot.png", p10, width = 15, height = 10)
+  
+  # Violin plots
+  p11 <- VlnPlot(so, features = present_markers, group.by = "cell_type", ncol = 3, pt.size = 0)
+  print(p11)
+  ggsave("figures/Dopamine_Markers_ViolinPlot.png", p11, width = 15, height = 10)
+}
+
+# Create D1R/D2R classification if not already present
+if(!"D1_D2_class" %in% colnames(so@meta.data) && all(c("DRD1", "DRD2") %in% rownames(so))) {
+  # Get normalized expression data
+  drd1_exp <- GetAssayData(so, assay = "RNA", layer = "data")["DRD1", ]
+  drd2_exp <- GetAssayData(so, assay = "RNA", layer = "data")["DRD2", ]
+  
+  # Classification thresholds (adjust based on your data)
+  so$D1_D2_class <- ifelse(drd1_exp > 1 & drd2_exp < 0.5, "D1R+",
+                           ifelse(drd2_exp > 1 & drd1_exp < 0.5, "D2R+", "Mixed/Other"))
+  
+  print("D1R/D2R Classification")
+  print(table(so$D1_D2_class))
+  
+  # Visualization of classification
+  p12 <- DimPlot(so, group.by = "D1_D2_class", reduction = "umap", 
+                 cols = c("D1R+" = "#FF6B6B", "D2R+" = "#4ECDC4", "Mixed/Other" = "#95A5A6"))
+  print(p12)
+  ggsave("figures/D1R_D2R_Classification.png", p12, width = 10, height = 8)
+}
+```
+
+## Subset to D1R+ and D2R+ MSNs
+
+```{r subset_msns}
+# Identify MSN populations - check both cell_type and D1_D2_class
+print("Identifying MSN Populations")
+
+if("cell_type" %in% colnames(so@meta.data)) {
+  # Use existing cell type annotations
+  msn_idents <- grep("DRD1|DRD2", unique(so@meta.data$cell_type), value = TRUE)
+  print(paste("MSN cell types found:", paste(msn_idents, collapse = ", ")))
+  
+  if(length(msn_idents) > 0) {
+    Idents(so) <- so$cell_type
+    so_msn <- subset(so, idents = msn_idents)
+  }
+} else if("D1_D2_class" %in% colnames(so@meta.data)) {
+  # Use our D1R/D2R classification
+  Idents(so) <- so$D1_D2_class
+  so_msn <- subset(so, idents = c("D1R+", "D2R+"))
+} else {
+  print("No clear MSN populations identified. Using all cells for now.")
+  so_msn <- so
+}
+
+print("MSN Subset Summary")
+print(paste("MSN cells:", ncol(so_msn)))
+print(paste("MSN genes:", nrow(so_msn)))
+
+# Set default assay and clean up
+DefaultAssay(so_msn) <- "RNA"
+
+# Filter low-expression genes
+non_zero_genes <- rownames(so_msn)[Matrix::rowSums(GetAssayData(so_msn, layer = "counts")) > 0]
+so_msn <- subset(so_msn, features = non_zero_genes)
+
+print(paste("Genes after filtering:", nrow(so_msn)))
+
+# Visualize MSN subset
+if(ncol(so_msn) > 100) { # Only plot if we have reasonable number of cells
+  p13 <- DimPlot(so_msn, reduction = "umap", group.by = "cell_type", label = TRUE)
+  print(p13)
+  ggsave("figures/MSN_Subset_UMAP.png", p13, width = 10, height = 8)
+}
+```
+
+## Differential Expression Analysis: D1R+ vs D2R+
+
+```{r differential_expression}
+if(ncol(so_msn) > 50) { # Ensure we have enough cells
+  print("Differential Expression Analysis")
+  
+  # Set identities for comparison
+  if("cell_type" %in% colnames(so_msn@meta.data) && 
+     any(grepl("DRD1|DRD2", so_msn@meta.data$cell_type))) {
+    Idents(so_msn) <- so_msn$cell_type
+    ident1 <- grep("DRD1", levels(Idents(so_msn)), value = TRUE)[1]
+    ident2 <- grep("DRD2", levels(Idents(so_msn)), value = TRUE)[1]
+  } else if("D1_D2_class" %in% colnames(so_msn@meta.data)) {
+    Idents(so_msn) <- so_msn$D1_D2_class
+    ident1 <- "D1R+"
+    ident2 <- "D2R+"
+  }
+  
+  if(exists("ident1") && exists("ident2")) {
+    print(paste("Comparing:", ident1, "vs", ident2))
+    
+    # Find differential markers
+    markers_drd1_vs_drd2 <- FindMarkers(so_msn, 
+                                       ident.1 = ident1, 
+                                       ident.2 = ident2, 
+                                       only.pos = FALSE,
+                                       min.pct = 0.1,
+                                       logfc.threshold = 0.25)
+    
+    # Add gene names as a column
+    markers_drd1_vs_drd2$gene <- rownames(markers_drd1_vs_drd2)
+    
+    # Save results
+    write.csv(markers_drd1_vs_drd2, "tables/DE_DRD1_vs_DRD2.csv")
+    
+    print("Top Differential Genes")
+    print(head(markers_drd1_vs_drd2[order(markers_drd1_vs_drd2$p_val_adj), ], 10))
+    
+    # Volcano plot
+    markers_drd1_vs_drd2$log10_padj <- -log10(markers_drd1_vs_drd2$p_val_adj + 1e-300)
+    
+    p14 <- ggplot(markers_drd1_vs_drd2, aes(x = avg_log2FC, y = log10_padj)) +
+      geom_point(alpha = 0.6, size = 1) +
+      geom_point(data = subset(markers_drd1_vs_drd2, p_val_adj < 0.05 & abs(avg_log2FC) > 0.5),
+                 aes(color = avg_log2FC > 0), size = 2) +
+      scale_color_manual(values = c("TRUE" = "#FF6B6B", "FALSE" = "#4ECDC4"),
+                        labels = c("D2R+ enriched", "D1R+ enriched")) +
+      labs(x = "Average log2(Fold Change)", y = "-log10(Adjusted P-value)",
+           title = paste(ident1, "vs", ident2, "- Differential Expression"),
+           color = "Enriched in:") +
+      theme_classic() +
+      geom_hline(yintercept = -log10(0.05), linetype = "dashed", alpha = 0.5) +
+      geom_vline(xintercept = c(-0.5, 0.5), linetype = "dashed", alpha = 0.5)
+    
+    print(p14)
+    ggsave("figures/Volcano_Plot_D1_vs_D2.png", p14, width = 10, height = 8)
+    
+    # Heatmap of top markers
+    top_markers <- markers_drd1_vs_drd2 %>%
+      filter(p_val_adj < 0.05) %>%
+      arrange(desc(abs(avg_log2FC))) %>%
+      head(50) %>%
+      pull(gene)
+    
+    if(length(top_markers) > 0) {
+      p15 <- DoHeatmap(so_msn, features = top_markers, group.by = "cell_type", size = 3) +
+        scale_fill_gradientn(colors = c("skyblue", "white", "coral"))
+      print(p15)
+      ggsave("figures/Heatmap_Top_DE_Genes.png", p15, width = 12, height = 8)
+    }
+  }
+} else {
+  print("Insufficient cells for differential expression analysis")
+}
+```
+
+## Gene Ontology Enrichment Analysis
+
+```{r go_enrichment}
+# Check if DE results exist and are not empty
+if (exists("markers_drd1_vs_drd2") && nrow(markers_drd1_vs_drd2) > 0) {
+  cat("Starting GO Enrichment Analysis\n")
+  
+  # Filter for significant genes
+  sig_genes <- markers_drd1_vs_drd2 %>%
+    filter(p_val_adj < 0.05, abs(avg_log2FC) > 0.25) %>%
+    pull(gene)
+  
+  cat("Significant genes for GO analysis:", length(sig_genes), "\n")
+  
+  if (length(sig_genes) >= 10) {
+    
+    # Function to perform enrichment and generate plots
+    perform_GO_enrichment <- function(genes, ontology, label) {
+      ego <- enrichGO(
+        gene = genes,
+        OrgDb = org.Hs.eg.db,
+        keyType = "SYMBOL",
+        ont = ontology,
+        pAdjustMethod = "BH",
+        pvalueCutoff = 0.05,
+        qvalueCutoff = 0.2
+      )
+      
+      ego_df <- as.data.frame(ego)
+      
+      if (nrow(ego_df) == 0) {
+        cat(paste("No significant GO terms found for", label, "\n"))
+        return(NULL)
+      }
+      
+      # Save enrichment results
+      write.csv(ego_df, file = paste0("tables/GO_Enrichment_", label, ".csv"), row.names = FALSE)
+      
+      # Barplot
+      p_bar <- barplot(ego, showCategory = 15, title = paste("GO", label))
+      ggsave(paste0("figures/GO_", label, "_Barplot.png"), plot = p_bar, width = 12, height = 8)
+      
+      # Dotplot
+      p_dot <- dotplot(ego, showCategory = 15, title = paste("GO", label), color = "p.adjust")
+      ggsave(paste0("figures/GO_", label, "_Dotplot.png"), plot = p_dot, width = 12, height = 8)
+      
+      print(p_bar)
+      print(p_dot)
+      
+       # Print top terms
+      print(head(ego_df[, c("ID", "Description", "p.adjust")], 10))
+      cat("Total significant terms:", nrow(ego_df))
+      
+      return(ego)
+    }
+    
+    # Run enrichment analysis for all 3 ontologies
+    ego_bp <- perform_GO_enrichment(sig_genes, ontology = "BP", label = "Biological_Process")
+    ego_mf <- perform_GO_enrichment(sig_genes, ontology = "MF", label = "Molecular_Function")
+    ego_cc <- perform_GO_enrichment(sig_genes, ontology = "CC", label = "Cellular_Component")
+    
+  } else {
+    cat("Too few significant genes (n <", 10, ") for meaningful GO analysis\n")
+  }
+  
+} else {
+  cat("No differential expression results available for GO analysis\n")
+}
+```
+
+## Epigenetic Regulator Expression Analysis
+
+```{r epigenetic_regulators}
+
+# Comprehensive list of epigenetic regulators
+epi_genes <- c(
+  # DNA methylation
+  "DNMT1", "DNMT3A", "DNMT3B", "TET1", "TET2", "TET3", "UHRF1",
+  # Histone modifications - writers
+  "EZH2", "EZH1", "SUZ12", "EED", "KMT2A", "KMT2D", "SETD1A", "SETD1B",
+  "KMT5A", "KMT5B", "KMT5C", "EHMT1", "EHMT2", "SUV39H1", "SUV39H2",
+  # Histone modifications - erasers  
+  "KDM1A", "KDM1B", "KDM4A", "KDM4B", "KDM4C", "KDM5A", "KDM5B", "KDM6A", "KDM6B",
+  "HDAC1", "HDAC2", "HDAC3", "SIRT1", "SIRT2", "SIRT6",
+  # Chromatin remodeling
+  "SMARCA4", "SMARCA2", "SMARCB1", "CHD1", "CHD2", "CHD7", "CHD8",
+  # DNA binding and regulation
+  "MECP2", "MBD1", "MBD2", "MBD3", "CTCF", "SATB1", "SATB2"
+)
+
+# Check which epigenetic genes are present
+present_epi_genes <- epi_genes[epi_genes %in% rownames(so_msn)]
+missing_epi_genes <- epi_genes[!epi_genes %in% rownames(so_msn)]
+
+print(paste("Present epigenetic genes:", length(present_epi_genes)))
+print(paste("Missing epigenetic genes:", length(missing_epi_genes)))
+print("Present genes:")
+print(present_epi_genes)
+
+if (length(present_epi_genes) > 0) {
+  
+  # Define top genes (up to 10) to use across violin and feature plots
+  top_epi_genes <- present_epi_genes[1:min(10, length(present_epi_genes))]
+  
+  # Violin plot of epigenetic regulators
+  p18 <- VlnPlot(
+    so_msn,
+    features = top_epi_genes,
+    group.by = "cell_type",
+    pt.size = 0,
+    ncol = 4
+  ) +
+    theme_minimal() +
+    ggtitle("Expression of Epigenetic Regulators by Cell Type")
+  
+  ggsave("figures/Epigenetic_Regulators_ViolinPlot.png", p18, width = 16, height = 12)
+  
+  print(p18)
+  
+  # Heatmap of all present epigenetic regulators (if enough genes)
+  if (length(present_epi_genes) >= 4) {
+    # Scale only the relevant genes to save memory
+    so_msn <- ScaleData(so_msn, features = nonzero_genes)
+    
+    # Then generate the heatmap
+    p19 <- DoHeatmap(
+      so_msn,
+      features = nonzero_genes,
+      group.by = "cell_type",
+      size = 3
+      ) +
+      scale_fill_gradientn(colors = c("skyblue", "white", "coral")) +
+      ggtitle("Heatmap of Epigenetic Regulator Expression") +
+      theme(
+        plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+        axis.text.y = element_text(size = 10),
+        axis.text.x = element_blank()
+        )
+    ggsave("figures/Epigenetic_Regulators_Heatmap.png", p19, width = 12, height = 10)
+    
+    print(p19)
+  }
+  
+  # Dot Plot to see average expression
+  if (length(nonzero_genes) >= 4) {
+    p_dot <- DotPlot(
+    so_msn,
+    features = nonzero_genes,
+    group.by = "cell_type"
+    ) +
+    RotatedAxis() +
+    scale_color_gradientn(colors = c("skyblue", "white", "coral")) +
+    ggtitle("DotPlot of Epigenetic Regulator Expression") +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+   
+    ggsave("figures/Epigenetic_Regulators_DotPlot.png", p_dot, width = 14, height = 8)
+    
+    print(p_dot)
+    }
+  
+  # UMAP FeaturePlot of top epigenetic regulators
+  if (length(top_epi_genes) >= 4) {
+    p20 <- FeaturePlot(
+      so_msn,
+      features = top_epi_genes,
+      ncol = 4,
+      reduction = "umap"
+    ) +
+      plot_layout(guides = "collect") +
+      plot_annotation(title = "UMAP: Expression of Epigenetic Regulators")
+    
+    ggsave("figures/Epigenetic_Regulators_FeaturePlot.png", p20, width = 16, height = 12)
+    
+    print(p20)
+    
+  }
+  
+  # Differential expression of epigenetic regulators between D1 and D2
+  if (exists("markers_drd1_vs_drd2")) {
+    epi_de_genes <- intersect(present_epi_genes, markers_drd1_vs_drd2$gene)
+    
+    if (length(epi_de_genes) > 0) {
+      epi_de_results <- markers_drd1_vs_drd2 %>%
+        filter(gene %in% epi_de_genes) %>%
+        arrange(p_val_adj)
+      
+      print(epi_de_results)
+      
+      write.csv(epi_de_results, "tables/Epigenetic_Regulators_DE.csv", row.names = FALSE)
+    }
+  }
+}
+
+```
+
+##Pseudobulk Differential Expression Analysis
+
+```{r}
+# Ensure required metadata exists
+if (!"D1_D2_class" %in% colnames(so_msn@meta.data)) {
+  stop("D1/D2 classification is missing.")
+}
+
+# Assign sample IDs only if missing
+if (!"sample" %in% colnames(so_msn@meta.data)) {
+  set.seed(123)  # for reproducibility
+
+  # Initialize sample column
+  so_msn$sample <- NA
+
+  # Assign sample IDs within each D1_D2_class group
+  for (class in unique(so_msn$D1_D2_class)) {
+    class_cells <- which(so_msn$D1_D2_class == class)
+    so_msn$sample[class_cells] <- paste0(
+      "Sample_", class, "_", sample(1:3, length(class_cells), replace = TRUE)
+    )
+  }
+}
+
+# Aggregate to pseudobulk
+counts <- GetAssayData(so_msn, slot = "counts")
+meta_df <- so_msn@meta.data[, c("sample", "D1_D2_class")]
+
+# Aggregate counts per sample
+pb_counts_list <- lapply(unique(meta_df$sample), function(s) {
+  cells <- rownames(meta_df[meta_df$sample == s, ])
+  group <- unique(meta_df[meta_df$sample == s, "D1_D2_class"])
+  if (length(group) == 1 && length(cells) > 0) {
+    Matrix::rowSums(counts[, cells, drop = FALSE])
+  } else {
+    NULL
+  }
+})
+
+pb_counts <- do.call(cbind, pb_counts_list)
+colnames(pb_counts) <- unique(meta_df$sample)
+
+
+# Build sample metadata
+pb_meta <- data.frame(
+  sample = colnames(pb_counts),
+  group = sapply(colnames(pb_counts), function(s) unique(meta_df[meta_df$sample == s, "D1_D2_class"]))
+)
+
+# Subset to only D1R+ and D2R+ groups
+keep_groups <- c("D1R+", "D2R+")
+keep_samples <- pb_meta$group %in% keep_groups
+pb_counts <- pb_counts[, keep_samples]
+pb_meta <- pb_meta[keep_samples, , drop = FALSE]
+pb_meta$group <- factor(pb_meta$group, levels = keep_groups)
+
+# Create DGEList and normalize
+dge <- DGEList(counts = pb_counts, group = pb_meta$group)
+dge <- dge[filterByExpr(dge), , keep.lib.sizes = FALSE]
+dge <- calcNormFactors(dge)
+
+# Design matrix
+design <- model.matrix(~0 + pb_meta$group)
+colnames(design) <- make.names(levels(pb_meta$group))
+
+# Estimate dispersion and fit model
+dge <- estimateDisp(dge, design)
+fit <- glmFit(dge, design)
+
+# Contrast: D1R+ vs D2R+
+contrast <- makeContrasts(D1R_vs_D2R = D1R. - D2R., levels = design)
+lrt <- glmLRT(fit, contrast = contrast)
+
+# Results
+pb_de_results <- topTags(lrt, n = Inf)$table %>%
+  rownames_to_column("gene") %>%
+  arrange(FDR)
+
+write.csv(pb_de_results, "tables/Pseudobulk_DE_D1R_vs_D2R.csv", row.names = FALSE)
+
+# Volcano Plot
+pb_de_results$log10FDR <- -log10(pb_de_results$FDR + 1e-300)
+p_pb_volcano <- ggplot(pb_de_results, aes(x = logFC, y = log10FDR)) +
+  geom_point(alpha = 0.5) +
+  geom_point(data = subset(pb_de_results, abs(logFC) > 1 & FDR < 0.05), aes(color = logFC > 0), size = 2) +
+  scale_color_manual(values = c("TRUE" = "#FF6B6B", "FALSE" = "#4ECDC4")) +
+  labs(title = "Pseudobulk DE: D1R+ vs D2R+", x = "log2 Fold Change", y = "-log10 FDR", color = "Upregulated in") +
+  theme_classic()
+ggsave("figures/Pseudobulk_Volcano_Plot.png", p_pb_volcano, width = 10, height = 8)
+
+print(p_pb_volcano)
+
+# Pseudobulk DE subset for epigenetic regulators
+epi_pe_de_results <- pb_de_results %>%
+  filter(gene %in% present_epi_genes) %>%
+  arrange(FDR)
+write.csv(epi_pe_de_results, "tables/Epigenetic_Regulators_Pseudobulk_DE.csv", row.names = FALSE)
+
+print(epi_pe_de_results)
+
+
+```
+
+##GO Enrichment for Pseudobulk DE Results
+
+```{r}
+# Check if pb_de_results exists and is not empty
+if (exists("pb_de_results") && nrow(pb_de_results) > 0) {
+  cat("Starting GO Enrichment Analysis for Pseudobulk\n")
+  
+  # Filter for significant genes
+  sig_genes_pb <- pb_de_results %>%
+    filter(FDR < 0.05, abs(logFC) > 1) %>%
+    pull(gene)
+  
+  cat("Significant genes for GO analysis:", length(sig_genes_pb), "\n")
+  
+  if (length(sig_genes_pb) >= 10) {
+    
+    # Function to perform enrichment and generate plots
+    perform_GO_enrichment <- function(genes, ontology, label) {
+      ego <- enrichGO(
+        gene = genes,
+        OrgDb = org.Hs.eg.db,
+        keyType = "SYMBOL",
+        ont = ontology,
+        pAdjustMethod = "BH",
+        pvalueCutoff = 0.05,
+        qvalueCutoff = 0.2
+      )
+      
+      ego_df <- as.data.frame(ego)
+      
+      if (nrow(ego_df) == 0) {
+        cat(paste("No significant GO terms found for", label, "\n"))
+        return(NULL)
+      }
+      
+      # Save enrichment results
+      write.csv(ego_df, file = paste0("tables/Pseudobulk_GO_Enrichment_", label, ".csv"), row.names = FALSE)
+      
+      # Barplot
+      p_bar <- barplot(ego, showCategory = 15, title = paste("GO", label))
+      ggsave(paste0("figures/Pseudobulk_GO_", label, "_Barplot.png"), plot = p_bar, width = 12, height = 8)
+      
+      # Dotplot
+      p_dot <- dotplot(ego, showCategory = 15, title = paste("GO", label), color = "p.adjust")
+      ggsave(paste0("figures/Pseudobulk_GO_", label, "_Dotplot.png"), plot = p_dot, width = 12, height = 8)
+      
+      print(p_bar)
+      print(p_dot)
+      
+      # Print top GO terms
+      print(head(ego_df[, c("ID", "Description", "p.adjust")], 10))
+      cat("Total significant GO terms:", nrow(ego_df), "\n")
+      
+      return(ego)
+    }
+    
+    # Run enrichment analysis for all 3 ontologies
+    ego_pb_bp <- perform_GO_enrichment(sig_genes_pb, ontology = "BP", label = "Biological_Process")
+    ego_pb_mf <- perform_GO_enrichment(sig_genes_pb, ontology = "MF", label = "Molecular_Function")
+    ego_pb_cc <- perform_GO_enrichment(sig_genes_pb, ontology = "CC", label = "Cellular_Component")
+    
+  } else {
+    cat("Too few significant genes (n <", 10, ") for meaningful GO analysis\n")
+  }
+  
+} else {
+  cat("No differential expression results available for Pseudobulk GO analysis\n")
+}
+```
+
+##Overlapping Differentially Expressed Genes: Single-cell vs Pseudo-bulk
+
+```{r}
+# Check that both DE result objects exist
+if (exists("markers_drd1_vs_drd2") && exists("pb_de_results")) {
+  
+  # Extract gene lists
+  sc_genes <- rownames(markers_drd1_vs_drd2)
+  pb_genes <- pb_de_results$gene
+  
+  # Identify overlapping genes
+  overlapping_genes <- intersect(sc_genes, pb_genes)
+  
+  cat("Number of overlapping DE genes:", length(overlapping_genes), "\n")
+  
+  # Subset both DE tables
+  overlap_sc <- markers_drd1_vs_drd2[overlapping_genes, , drop = FALSE]
+  overlap_pb <- pb_de_results %>% filter(gene %in% overlapping_genes)
+  
+  # Merge results into a single table
+  overlap_merged <- merge(
+    overlap_sc %>% dplyr::select(avg_log2FC, p_val_adj) %>% 
+      dplyr::rename(sc_log2FC = avg_log2FC, sc_padj = p_val_adj),
+    overlap_pb %>% dplyr::select(gene, logFC, FDR) %>% 
+      dplyr::rename(pb_log2FC = logFC, pb_FDR = FDR),
+    by.x = "row.names", by.y = "gene"
+  )
+  colnames(overlap_merged)[1] <- "gene"
+  
+   # Print top genes by adjusted p-values
+  print(head(overlap_merged[order(overlap_merged$sc_padj + overlap_merged$pb_FDR), ], 10))
+  
+  # Save table
+  write.csv(overlap_merged, "tables/Overlapping_DEGs_SC_vs_PB.csv", row.names = FALSE)
+  
+  #Highlight genes with large disagreement between methods
+  overlap_merged$highlight <- ifelse(
+  abs(overlap_merged$pb_log2FC - overlap_merged$sc_log2FC) > 2,
+  "yes", "no"
+  )
+ 
+  #Highlight top 20 by absolute difference
+  overlap_merged$abs_diff <- abs(overlap_merged$pb_log2FC - overlap_merged$sc_log2FC)
+  # Rank and mark top genes
+  overlap_merged <- overlap_merged[order(-overlap_merged$abs_diff), ]
+  overlap_merged$highlight <- "no"
+  overlap_merged$highlight[1:20] <- "yes"
+  
+  # Plot comparison of log2FC
+
+  p_overlap <- ggplot(overlap_merged, aes(x = pb_log2FC, y = sc_log2FC)) +
+    geom_point(aes(color = highlight), alpha = 0.6) +
+    geom_smooth(method = "lm", color = "red", se = FALSE) +
+    scale_color_manual(values = c("no" = "black", "yes" = "blue")) +
+    geom_text_repel(data = subset(overlap_merged, highlight == "yes"),
+                    aes(label = gene),
+                    size = 3, max.overlaps = 10) +
+    labs(x = "Pseudo-bulk log2FC", y = "Single-cell log2FC",
+         title = "Overlap of DE Genes: Single-cell vs Pseudo-bulk") +
+    theme_classic() +
+    theme(legend.position = "none")
+  
+  ggsave("figures/Overlap_DEGs_log2FC_Comparison_auto_highlighted.png", p_overlap, width = 8, height = 6)
+  print(p_overlap)
+
+  
+} else {
+  cat("One or both DE result objects not found.\n")
+}
+
+```
+
+
+## Summary and Data Export
+
+```{r summary_export}
+# Summary of Analysis
+print("Analysis Summary")
+
+# Basic counts
+print(paste("Total cells in full dataset:", ncol(so)))
+print(paste("MSN cells analyzed:", ncol(so_msn)))
+print(paste("Total genes (MSN):", nrow(so_msn)))
+print(paste("Epigenetic regulators detected:", length(present_epi_genes)))
+
+# DE statistics - single-cell
+if (exists("markers_drd1_vs_drd2")) {
+  sc_sig_genes <- sum(markers_drd1_vs_drd2$p_val_adj < 0.05)
+  print(paste("Significant DE genes (single-cell, padj < 0.05):", sc_sig_genes))
+}
+
+# DE statistics - pseudobulk
+if (exists("pb_de_results")) {
+  pb_sig_genes <- sum(pb_de_results$FDR < 0.05 & abs(pb_de_results$logFC) > 1)
+  print(paste("Significant DE genes (pseudobulk, FDR < 0.05 & abs(logFC) > 1):", pb_sig_genes))
+}
+
+# Overlap summary
+if (exists("overlap_merged")) {
+  print(paste("Overlapping DE genes between single-cell and pseudobulk:", nrow(overlap_merged)))
+  print(paste("Top disagreement genes highlighted in plot:", sum(overlap_merged$highlight == "yes")))
+}
+
+# Save processed objects
+saveRDS(so, "tables/Processed_Full_Dataset.rds")
+saveRDS(so_msn, "tables/Filtered_MSN_Dataset.rds")
+
+# Create summary table
+analysis_summary <- data.frame(
+  Metric = c("Total cells (original)", "Total cells (filtered)", "MSN cells", 
+             "Total genes", "Variable features", "Epigenetic regulators detected",
+             "Significant DE genes (single-cell)", "Significant DE genes (pseudobulk)", 
+             "Overlapping DEGs (SC vs PB)"),
+  Value = c(
+    ncol(readRDS("raw_data/GSE167920_Results_full_nuclei_processed_final.rds")),
+    ncol(so),
+    ncol(so_msn),
+    nrow(so_msn),
+    length(VariableFeatures(so_msn)),
+    length(present_epi_genes),
+    if (exists("sc_sig_genes")) sc_sig_genes else NA,
+    if (exists("pb_sig_genes")) pb_sig_genes else NA,
+    if (exists("overlap_merged")) nrow(overlap_merged) else NA
+  )
+)
+
+write.csv(analysis_summary, "tables/Analysis_Summary.csv", row.names = FALSE)
+print(analysis_summary)
+
+print("Analysis Complete")
+print("Check the 'figures/' and 'tables/' directories for outputs")
+
+```
