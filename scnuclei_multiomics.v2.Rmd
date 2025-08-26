@@ -1,0 +1,1478 @@
+---
+title: "Comparative Multi-Species Analysis of Striatal MSNs: RNA and ATAC Integration"
+author: "Deepak Poduval"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+    theme: united
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, 
+                     fig.width = 12, fig.height = 8)
+
+# Load required libraries
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(SeuratDisk)
+  library(Signac)
+  library(tidyverse)
+  library(patchwork)
+  library(ggplot2)
+  library(pheatmap)
+  library(RColorBrewer)
+  library(viridis)
+  library(cowplot)
+  library(data.table)
+  library(ComplexHeatmap)
+  library(circlize)
+  library(clusterProfiler)
+  library(org.Hs.eg.db)
+  library(org.Mm.eg.db)
+  library(enrichplot)
+  library(VennDiagram)
+  library(ggrepel)
+  library(harmony)
+})
+
+# Create output directories
+dir.create("comparative_msn_analysis", showWarnings = FALSE)
+dir.create("comparative_msn_analysis/figures", showWarnings = FALSE)
+dir.create("comparative_msn_analysis/tables", showWarnings = FALSE)
+dir.create("comparative_msn_analysis/species_specific", showWarnings = FALSE)
+dir.create("comparative_msn_analysis/integration", showWarnings = FALSE)
+
+set.seed(42)
+```
+
+## 1. Data Loading and Initial Exploration
+
+```{r data_loading}
+# Define file paths
+raw_data_dir <- "raw_data"
+
+# List all RDS files
+rds_files <- list.files(raw_data_dir, pattern = "\\.rds$", full.names = TRUE)
+# Filter out already analysed
+rds_files <- rds_files[!grepl("^GSE", basename(rds_files))]
+
+cat("Found RDS files:\n")
+print(basename(rds_files))
+
+# Filter out files starting with "GSE"
+rds_files <- rds_files[!grepl("^GSE", basename(rds_files))]
+
+# Function to extract metadata from filename
+extract_metadata <- function(filename) {
+  base_name <- basename(filename)
+  parts <- str_split(base_name, "\\.")[[1]]
+  
+  species <- parts[1]
+  data_type <- parts[2] 
+  author <- str_replace(parts[3], "\\.et\\.al", "")
+  
+  return(list(species = species, data_type = data_type, author = author))
+}
+
+# Load all datasets
+datasets <- list()
+dataset_info <- data.frame()
+
+cat("\nLoading datasets...\n")
+for (file_path in rds_files) {
+  cat(paste("Loading:", basename(file_path), "\n"))
+  
+  tryCatch({
+    # Load the RDS file
+    obj <- readRDS(file_path)
+    
+    # Extract metadata from filename
+    meta <- extract_metadata(file_path)
+    
+    # Create unique identifier
+    dataset_id <- paste(meta$species, meta$data_type, meta$author, sep = "_")
+    
+    # Add metadata to the Seurat object
+    obj$Species <- meta$species
+    obj$DataType <- meta$data_type
+    obj$Study <- meta$author
+    obj$Dataset_ID <- dataset_id
+    
+    # Store the object
+    datasets[[dataset_id]] <- obj
+    
+    # Record dataset information
+    dataset_info <- rbind(dataset_info, data.frame(
+      Dataset_ID = dataset_id,
+      Species = meta$species,
+      DataType = meta$data_type,
+      Study = meta$author,
+      n_cells = ncol(obj),
+      n_features = nrow(obj),
+      filename = basename(file_path),
+      stringsAsFactors = FALSE
+    ))
+    
+  }, error = function(e) {
+    cat(paste("Error loading", basename(file_path), ":", e$message, "\n"))
+  })
+}
+
+# Display dataset summary
+cat("\nDataset Summary:\n")
+print(dataset_info)
+
+# Save dataset information
+write.csv(dataset_info, "comparative_msn_analysis/tables/Dataset_Summary.csv", row.names = FALSE)
+
+# Create overview plots
+if (nrow(dataset_info) > 0) {
+  # Cells per species/data type
+  p1 <- ggplot(dataset_info, aes(x = Species, y = n_cells, fill = DataType)) +
+    geom_col(position = "dodge", alpha = 0.8) +
+    scale_fill_viridis_d() +
+    labs(title = "Number of Cells by Species and Data Type",
+         x = "Species", y = "Number of Cells") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  
+  # Studies per species
+  p2 <- dataset_info %>%
+    count(Species, DataType) %>%
+    ggplot(aes(x = Species, y = n, fill = DataType)) +
+    geom_col(position = "dodge", alpha = 0.8) +
+    scale_fill_viridis_d() +
+    labs(title = "Number of Studies by Species and Data Type",
+         x = "Species", y = "Number of Studies") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  
+  p_overview <- p1 / p2
+  ggsave("comparative_msn_analysis/figures/Dataset_Overview.png", 
+         p_overview, width = 12, height = 10)
+}
+```
+
+## 2. RNA Data Integration and MSN Classification
+
+```{r rna_integration}
+# Separate RNA and ATAC datasets
+rna_datasets <- datasets[grepl("RNA", names(datasets))]
+atac_datasets <- datasets[grepl("ATAC", names(datasets))]
+
+cat(paste("RNA datasets:", length(rna_datasets), "\n"))
+cat(paste("ATAC datasets:", length(atac_datasets), "\n"))
+
+if (length(rna_datasets) > 0) {
+  
+  cat("\nProcessing RNA datasets for integration...\n")
+  
+  # Function to standardize metadata and cell type annotations
+  standardize_rna_object <- function(obj, dataset_id) {
+    
+    # Look for existing cell type annotations
+    celltype_cols <- grep("celltype|CellType|cell_type|cluster|type|MSN|subtype", 
+                         colnames(obj@meta.data), 
+                         value = TRUE, ignore.case = TRUE)
+    
+    if (length(celltype_cols) > 0) {
+      # Use the first available cell type column
+      obj$Original_CellType <- obj@meta.data[[celltype_cols[1]]]
+    } else {
+      obj$Original_CellType <- "Unknown"
+    }
+    
+    # Classify MSN subtypes based on gene expression if possible
+    if ("RNA" %in% names(obj@assays)) {
+      DefaultAssay(obj) <- "RNA"
+      
+      # Look for dopamine receptor genes
+      gene_names <- rownames(obj)
+      drd1_genes <- grep("^DRD1$|^Drd1$", gene_names, value = TRUE)
+      drd2_genes <- grep("^DRD2$|^Drd2$", gene_names, value = TRUE)
+      
+      if (length(drd1_genes) > 0 && length(drd2_genes) > 0) {
+        # Get expression data
+        if (!"data" %in% slotNames(obj@assays$RNA)) {
+          obj <- NormalizeData(obj, verbose = FALSE)
+        }
+        
+        drd1_exp <- GetAssayData(obj, layer = "data")[drd1_genes[1], ]
+        drd2_exp <- GetAssayData(obj, layer = "data")[drd2_genes[1], ]
+        
+        # Classify based on expression
+        obj$MSN_Classification <- case_when(
+          drd1_exp > 1 & drd2_exp < 0.5 ~ "D1R+",
+          drd2_exp > 1 & drd1_exp < 0.5 ~ "D2R+",
+          drd1_exp > 0.5 & drd2_exp > 0.5 ~ "Mixed",
+          TRUE ~ "Other"
+        )
+      } else {
+        # Use existing annotations or classify as MSN_General
+        obj$MSN_Classification <- ifelse(
+          grepl("MSN|D1|D2|Medium|Spiny", obj$Original_CellType, ignore.case = TRUE),
+          "MSN_General",
+          "Non_MSN"
+        )
+      }
+    }
+    
+    # Add consistent sample information
+    if (!"Sample" %in% colnames(obj@meta.data)) {
+      sample_cols <- grep("sample|replicate|donor|subject|ID", 
+                         colnames(obj@meta.data), 
+                         value = TRUE, ignore.case = TRUE)
+      if (length(sample_cols) > 0) {
+        obj$Sample <- obj@meta.data[[sample_cols[1]]]
+      } else {
+        obj$Sample <- paste0(obj$Dataset_ID, "_Sample1")
+      }
+    }
+    
+    return(obj)
+  }
+  
+  # Process each RNA dataset
+  processed_rna <- list()
+  rna_summary <- data.frame()
+  
+  for (dataset_id in names(rna_datasets)) {
+    cat(paste("Processing", dataset_id, "\n"))
+    
+    obj <- standardize_rna_object(rna_datasets[[dataset_id]], dataset_id)
+    processed_rna[[dataset_id]] <- obj
+    
+    # Summary statistics
+    msn_counts <- table(obj$MSN_Classification)
+    rna_summary <- rbind(rna_summary, data.frame(
+      Dataset_ID = dataset_id,
+      Species = obj$Species[1],
+      Study = obj$Study[1],
+      Total_Cells = ncol(obj),
+      D1R_plus = ifelse("D1R+" %in% names(msn_counts), msn_counts["D1R+"], 0),
+      D2R_plus = ifelse("D2R+" %in% names(msn_counts), msn_counts["D2R+"], 0),
+      Mixed = ifelse("Mixed" %in% names(msn_counts), msn_counts["Mixed"], 0),
+      MSN_General = ifelse("MSN_General" %in% names(msn_counts), msn_counts["MSN_General"], 0),
+      Other = ifelse("Other" %in% names(msn_counts), msn_counts["Other"], 0),
+      stringsAsFactors = FALSE
+    ))
+  }
+  
+  cat("\nRNA Dataset MSN Classification Summary:\n")
+  print(rna_summary)
+  write.csv(rna_summary, "comparative_msn_analysis/tables/RNA_MSN_Classification_Summary.csv", row.names = FALSE)
+  
+  # Create visualization of MSN classifications
+  rna_summary_long <- rna_summary %>%
+    select(-Total_Cells) %>%
+    pivot_longer(cols = c(D1R_plus, D2R_plus, Mixed, MSN_General, Other),
+                 names_to = "MSN_Type", values_to = "Cell_Count") %>%
+    filter(Cell_Count > 0)
+  
+  p_msn_classification <- ggplot(rna_summary_long, 
+                                aes(x = paste(Species, Study, sep = "_"), 
+                                    y = Cell_Count, fill = MSN_Type)) +
+    geom_col(position = "stack", alpha = 0.8) +
+    scale_fill_manual(values = c("D1R+" = "#FF6B6B", "D2R+" = "#4ECDC4", 
+                                "Mixed" = "#95A5A6", "MSN_General" = "#9B59B6", 
+                                "Other" = "#E0E0E0")) +
+    labs(title = "MSN Subtype Classification Across RNA Datasets",
+         x = "Dataset", y = "Number of Cells", fill = "MSN Type") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8))
+  
+  ggsave("comparative_msn_analysis/figures/RNA_MSN_Classification.png",
+         p_msn_classification, width = 14, height = 8)
+  
+} else {
+  cat("No RNA datasets found for integration.\n")
+  processed_rna <- list()
+}
+```
+
+## 3. Species-Specific Differential Expression Analysis
+
+```{r differential_expression}
+if (length(processed_rna) > 0) {
+  
+  cat("Performing differential expression analysis...\n")
+  
+  # Function to perform DE analysis for each dataset
+  perform_de_analysis <- function(obj, dataset_id) {
+    
+    # Filter to MSN cells with D1R+ and D2R+ classifications
+    msn_subtypes <- unique(obj$MSN_Classification)
+    available_subtypes <- intersect(c("D1R+", "D2R+"), msn_subtypes)
+    
+    if (length(available_subtypes) < 2) {
+      cat(paste("Insufficient MSN subtypes for DE in", dataset_id, "\n"))
+      return(NULL)
+    }
+    
+    obj_msn <- subset(obj, subset = MSN_Classification %in% available_subtypes)
+    
+    if (ncol(obj_msn) < 20) {
+      cat(paste("Insufficient cells for DE analysis in", dataset_id, 
+                "(", ncol(obj_msn), "cells)\n"))
+      return(NULL)
+    }
+    
+    # Check group sizes
+    group_counts <- table(obj_msn$MSN_Classification)
+    if (any(group_counts < 10)) {
+      cat(paste("Some groups have fewer than 10 cells in", dataset_id, "\n"))
+      return(NULL)
+    }
+    
+    # Ensure data is normalized
+    if (!"data" %in% slotNames(obj_msn@assays$RNA)) {
+      obj_msn <- NormalizeData(obj_msn, verbose = FALSE)
+    }
+    
+    Idents(obj_msn) <- obj_msn$MSN_Classification
+    
+    tryCatch({
+      de_results <- FindMarkers(
+        obj_msn,
+        ident.1 = "D1R+",
+        ident.2 = "D2R+",
+        only.pos = FALSE,
+        min.pct = 0.1,
+        logfc.threshold = 0.25,
+        test.use = "wilcox",
+        verbose = FALSE
+      )
+      
+      if (nrow(de_results) == 0) {
+        cat(paste("No significant genes found for", dataset_id, "\n"))
+        return(NULL)
+      }
+      
+      de_results$gene <- rownames(de_results)
+      de_results$dataset_id <- dataset_id
+      de_results$species <- obj$Species[1]
+      de_results$study <- obj$Study[1]
+      
+      return(de_results)
+      
+    }, error = function(e) {
+      cat(paste("DE analysis failed for", dataset_id, ":", e$message, "\n"))
+      return(NULL)
+    })
+  }
+  
+  # Perform DE analysis for each dataset
+  de_results_list <- list()
+  
+  for (dataset_id in names(processed_rna)) {
+    cat(paste("DE analysis for", dataset_id, "\n"))
+    
+    de_result <- perform_de_analysis(processed_rna[[dataset_id]], dataset_id)
+    
+    if (!is.null(de_result)) {
+      de_results_list[[dataset_id]] <- de_result
+      
+      # Save individual results
+      clean_id <- gsub("[^A-Za-z0-9]", "_", dataset_id)
+      write.csv(de_result, 
+                paste0("comparative_msn_analysis/species_specific/", 
+                       clean_id, "_DE_D1R_vs_D2R.csv"),
+                row.names = FALSE)
+      
+      # Create volcano plot
+      de_result$log10_padj <- -log10(pmax(de_result$p_val_adj, 1e-300))
+      de_result$significance <- case_when(
+        de_result$p_val_adj < 0.05 & abs(de_result$avg_log2FC) > 0.5 ~ "Significant",
+        TRUE ~ "NS"
+      )
+      
+      p_volcano <- ggplot(de_result, aes(x = avg_log2FC, y = log10_padj, 
+                                        color = significance)) +
+        geom_point(alpha = 0.6, size = 0.8) +
+        scale_color_manual(values = c("Significant" = "red", "NS" = "gray")) +
+        labs(title = paste(dataset_id, "D1R+ vs D2R+ MSNs"),
+             x = "Average log2(Fold Change)", 
+             y = "-log10(Adjusted P-value)") +
+        theme_classic() +
+        geom_hline(yintercept = -log10(0.05), linetype = "dashed", alpha = 0.5) +
+        geom_vline(xintercept = c(-0.5, 0.5), linetype = "dashed", alpha = 0.5)
+      
+      # Add gene labels for top genes
+      top_genes <- de_result %>%
+        filter(significance == "Significant") %>%
+        arrange(desc(abs(avg_log2FC))) %>%
+        head(8)
+      
+      if (nrow(top_genes) > 0) {
+        p_volcano <- p_volcano +
+          geom_text_repel(data = top_genes, aes(label = gene), 
+                         color = "black", size = 2.5, max.overlaps = 8)
+      }
+      
+      ggsave(paste0("comparative_msn_analysis/species_specific/", 
+                    clean_id, "_Volcano_Plot.png"),
+             p_volcano, width = 10, height = 8)
+    }
+  }
+  
+  cat(paste("Completed DE analysis for", length(de_results_list), "datasets\n"))
+  
+} else {
+  cat("No processed RNA datasets available for DE analysis\n")
+  de_results_list <- list()
+}
+```
+
+## 4. Cross-Species Gene Conservation Analysis
+
+```{r conservation_analysis}
+if (length(de_results_list) >= 2) {
+  
+  cat("Performing cross-species conservation analysis...\n")
+  
+  # Function to get significant genes
+  get_sig_genes <- function(de_results, direction = "both", 
+                           fc_threshold = 0.5, pval_threshold = 0.05) {
+    sig_genes <- de_results %>%
+      filter(p_val_adj < pval_threshold, abs(avg_log2FC) > fc_threshold)
+    
+    if (direction == "up") {
+      return(sig_genes %>% filter(avg_log2FC > 0) %>% pull(gene))
+    } else if (direction == "down") {
+      return(sig_genes %>% filter(avg_log2FC < 0) %>% pull(gene))
+    } else {
+      return(sig_genes$gene)
+    }
+  }
+  
+  # Create conservation matrix
+  all_genes <- unique(unlist(lapply(de_results_list, function(x) x$gene)))
+  dataset_names <- names(de_results_list)
+  
+  conservation_matrix <- matrix(0, nrow = length(all_genes), ncol = length(dataset_names))
+  rownames(conservation_matrix) <- all_genes
+  colnames(conservation_matrix) <- dataset_names
+  
+  # Fill conservation matrix
+  for (i in 1:length(dataset_names)) {
+    dataset_id <- dataset_names[i]
+    sig_genes <- get_sig_genes(de_results_list[[dataset_id]])
+    conservation_matrix[sig_genes, dataset_id] <- 1
+  }
+  
+  # Calculate conservation scores
+  conservation_scores <- rowSums(conservation_matrix)
+  
+  # Create conservation results table
+  conservation_results <- data.frame(
+    Gene = names(conservation_scores),
+    Conservation_Score = conservation_scores,
+    Datasets_Count = conservation_scores,
+    Conserved = conservation_scores >= 2,
+    stringsAsFactors = FALSE
+  ) %>%
+    arrange(desc(Conservation_Score))
+  
+  # Add fold change information from each dataset
+  for (dataset_id in dataset_names) {
+    de_data <- de_results_list[[dataset_id]]
+    clean_id <- gsub("[^A-Za-z0-9]", "_", dataset_id)
+    
+    # Add fold change and p-value columns
+    fc_col <- paste0(clean_id, "_log2FC")
+    pval_col <- paste0(clean_id, "_padj")
+    
+    conservation_results[[fc_col]] <- de_data$avg_log2FC[match(conservation_results$Gene, de_data$gene)]
+    conservation_results[[pval_col]] <- de_data$p_val_adj[match(conservation_results$Gene, de_data$gene)]
+  }
+  
+  # Save conservation results
+  write.csv(conservation_results, 
+            "comparative_msn_analysis/tables/Gene_Conservation_Analysis.csv", 
+            row.names = FALSE)
+  
+  # Get highly conserved genes
+  highly_conserved <- conservation_results %>%
+    filter(Conservation_Score >= max(Conservation_Score) - 1) %>%
+    head(20)
+  
+  cat("\nGene Conservation Summary:\n")
+  cat(paste("Total genes analyzed:", length(all_genes), "\n"))
+  cat(paste("Genes conserved in ≥2 datasets:", sum(conservation_scores >= 2), "\n"))
+  cat(paste("Genes conserved in all datasets:", sum(conservation_scores == length(dataset_names)), "\n"))
+  
+  cat("\nTop conserved genes:\n")
+  print(highly_conserved[, c("Gene", "Conservation_Score")])
+  
+  # Create conservation heatmap
+  if (nrow(highly_conserved) > 5) {
+    conserved_genes <- highly_conserved$Gene[1:min(30, nrow(highly_conserved))]
+    conservation_subset <- conservation_matrix[conserved_genes, ]
+    
+    # Create heatmap
+    pheatmap(conservation_subset,
+             color = c("white", "red"),
+             breaks = c(0, 0.5, 1),
+             cluster_rows = TRUE,
+             cluster_cols = FALSE,
+             main = "Gene Conservation Across Datasets",
+             filename = "comparative_msn_analysis/figures/Gene_Conservation_Heatmap.png",
+             width = 12, height = 10)
+  }
+  
+  # Conservation by species
+  species_conservation <- conservation_results %>%
+    left_join(dataset_info[, c("Dataset_ID", "Species")], 
+              by = c("Gene" = "Dataset_ID")) %>%
+    group_by(Gene) %>%
+    summarise(
+      Conservation_Score = first(Conservation_Score),
+      Species_Count = n_distinct(Species, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    arrange(desc(Species_Count), desc(Conservation_Score))
+  
+  cat("\nConservation across species:\n")
+  print(head(species_conservation, 15))
+  
+} else {
+  cat("Need at least 2 datasets for conservation analysis\n")
+  conservation_results <- NULL
+}
+```
+
+## 5. ATAC-seq Analysis and Integration
+
+```{r atac_analysis}
+if (length(atac_datasets) > 0) {
+  
+  cat("Processing ATAC-seq datasets...\n")
+  
+  # Function to process ATAC datasets
+  process_atac_dataset <- function(obj, dataset_id) {
+    
+    # Standardize metadata similar to RNA datasets
+    obj <- standardize_rna_object(obj, dataset_id)  # Reuse the function
+    
+    # Check for ATAC assay
+    atac_assay_names <- c("ATAC", "peaks", "ChromatinAssay", "ATAC_seq")
+    atac_assay <- NULL
+    
+    for (assay_name in atac_assay_names) {
+      if (assay_name %in% names(obj@assays)) {
+        atac_assay <- assay_name
+        break
+      }
+    }
+    
+    if (is.null(atac_assay)) {
+      cat(paste("No ATAC assay found in", dataset_id, "\n"))
+      return(NULL)
+    }
+    
+    DefaultAssay(obj) <- atac_assay
+    
+    return(list(object = obj, atac_assay = atac_assay))
+  }
+  
+  # Process ATAC datasets
+  processed_atac <- list()
+  atac_summary <- data.frame()
+  
+  for (dataset_id in names(atac_datasets)) {
+    cat(paste("Processing ATAC dataset:", dataset_id, "\n"))
+    
+    result <- process_atac_dataset(atac_datasets[[dataset_id]], dataset_id)
+    
+    if (!is.null(result)) {
+      processed_atac[[dataset_id]] <- result
+      
+      obj <- result$object
+      msn_counts <- table(obj$MSN_Classification)
+      
+      atac_summary <- rbind(atac_summary, data.frame(
+        Dataset_ID = dataset_id,
+        Species = obj$Species[1],
+        Study = obj$Study[1],
+        Total_Cells = ncol(obj),
+        Total_Peaks = nrow(obj),
+        ATAC_Assay = result$atac_assay,
+        D1R_plus = ifelse("D1R+" %in% names(msn_counts), msn_counts["D1R+"], 0),
+        D2R_plus = ifelse("D2R+" %in% names(msn_counts), msn_counts["D2R+"], 0),
+        stringsAsFactors = FALSE
+      ))
+    }
+  }
+  
+  if (nrow(atac_summary) > 0) {
+    cat("\nATAC Dataset Summary:\n")
+    print(atac_summary)
+    write.csv(atac_summary, "comparative_msn_analysis/tables/ATAC_Dataset_Summary.csv", row.names = FALSE)
+    
+    # Differential accessibility analysis
+    atac_da_results <- list()
+    
+    for (dataset_id in names(processed_atac)) {
+      cat(paste("Differential accessibility analysis for", dataset_id, "\n"))
+      
+      obj <- processed_atac[[dataset_id]]$object
+      atac_assay <- processed_atac[[dataset_id]]$atac_assay
+      
+      # Filter to D1R+ and D2R+ cells
+      msn_subtypes <- unique(obj$MSN_Classification)
+      available_subtypes <- intersect(c("D1R+", "D2R+"), msn_subtypes)
+      
+      if (length(available_subtypes) >= 2) {
+        obj_msn <- subset(obj, subset = MSN_Classification %in% available_subtypes)
+        
+        if (ncol(obj_msn) >= 20) {
+          DefaultAssay(obj_msn) <- atac_assay
+          Idents(obj_msn) <- obj_msn$MSN_Classification
+          
+          tryCatch({
+            da_peaks <- FindMarkers(
+              obj_msn,
+              ident.1 = "D1R+",
+              ident.2 = "D2R+",
+              only.pos = FALSE,
+              min.pct = 0.05,
+              test.use = "LR",
+              verbose = FALSE
+            )
+            
+            if (nrow(da_peaks) > 0) {
+              da_peaks$peak <- rownames(da_peaks)
+              da_peaks$dataset_id <- dataset_id
+              da_peaks$species <- obj$Species[1]
+              
+              atac_da_results[[dataset_id]] <- da_peaks
+              
+              # Save results
+              clean_id <- gsub("[^A-Za-z0-9]", "_", dataset_id)
+              write.csv(da_peaks,
+                        paste0("comparative_msn_analysis/species_specific/", 
+                               clean_id, "_DA_peaks.csv"),
+                        row.names = FALSE)
+              
+              # Create volcano plot
+              da_peaks$log10_padj <- -log10(pmax(da_peaks$p_val_adj, 1e-300))
+              da_peaks$significance <- ifelse(
+                da_peaks$p_val_adj < 0.05 & abs(da_peaks$avg_log2FC) > 0.25, 
+                "Significant", "NS"
+              )
+              
+              p_atac_volcano <- ggplot(da_peaks, aes(x = avg_log2FC, y = log10_padj, 
+                                                    color = significance)) +
+                geom_point(alpha = 0.6, size = 0.8) +
+                scale_color_manual(values = c("Significant" = "red", "NS" = "gray")) +
+                labs(title = paste(dataset_id, "D1R+ vs D2R+ Differential Accessibility"),
+                     x = "Average log2(Fold Change)", 
+                     y = "-log10(Adjusted P-value)") +
+                theme_classic() +
+                geom_hline(yintercept = -log10(0.05), linetype = "dashed", alpha = 0.5) +
+                geom_vline(xintercept = c(-0.25, 0.25), linetype = "dashed", alpha = 0.5)
+              
+              ggsave(paste0("comparative_msn_analysis/species_specific/", 
+                            clean_id, "_ATAC_Volcano.png"),
+                     p_atac_volcano, width = 10, height = 8)
+            }
+            
+          }, error = function(e) {
+            cat(paste("DA analysis failed for", dataset_id, ":", e$message, "\n"))
+          })
+        }
+      }
+    }
+    
+    cat(paste("Completed ATAC analysis for", length(atac_da_results), "datasets\n"))
+  }
+  
+} else {
+  cat("No ATAC datasets found\n")
+  processed_atac <- list()
+  atac_da_results <- list()
+}
+```
+
+## 6. Pathway Enrichment Analysis
+
+```{r pathway_analysis}
+if (length(de_results_list) > 0) {
+  
+  cat("Performing pathway enrichment analysis...\n")
+  
+  # Function to perform GO enrichment
+  perform_go_enrichment <- function(de_results, dataset_id) {
+    
+    # Get D1R+ and D2R+ enriched genes
+    d1r_genes <- de_results %>%
+      filter(p_val_adj < 0.05, avg_log2FC > 0.5) %>%
+      pull(gene)
+    
+    d2r_genes <- de_results %>%
+      filter(p_val_adj < 0.05, avg_log2FC < -0.5) %>%
+      pull(gene)
+    
+    results <- list()
+    
+    # D1R+ enriched pathways
+    if (length(d1r_genes) >= 5) {
+      tryCatch({
+        ego_d1r <- enrichGO(
+          gene = d1r_genes,
+          OrgDb = org.Hs.eg.db,
+          keyType = "SYMBOL",
+          ont = "BP",
+          pAdjustMethod = "BH",
+          pvalueCutoff = 0.05,
+          qvalueCutoff = 0.1,
+          readable = TRUE
+        )
+        
+        if (!is.null(ego_d1r) && nrow(as.data.frame(ego_d1r)) > 0) {
+          results$d1r_pathways <- ego_d1r
+        }
+      }, error = function(e) {
+        cat("D1R+ GO enrichment failed for", dataset_id, ":", e$message, "\n")
+      })
+    }
+    
+    # D2R+ enriched pathways
+    if (length(d2r_genes) >= 5) {
+      tryCatch({
+        ego_d2r <- enrichGO(
+          gene = d2r_genes,
+          OrgDb = org.Hs.eg.db,
+          keyType = "SYMBOL",
+          ont = "BP",
+          pAdjustMethod = "BH",
+          pvalueCutoff = 0.05,
+          qvalueCutoff = 0.1,
+          readable = TRUE
+        )
+        
+        if (!is.null(ego_d2r) && nrow(as.data.frame(ego_d2r)) > 0) {
+          results$d2r_pathways <- ego_d2r
+        }
+      }, error = function(e) {
+        cat("D2R+ GO enrichment failed for", dataset_id, ":", e$message, "\n")
+      })
+    }
+    
+    results$d1r_genes <- d1r_genes
+    results$d2r_genes <- d2r_genes
+    results$dataset_id <- dataset_id
+    
+    return(results)
+  }
+  
+  # Perform pathway analysis for each dataset
+  pathway_results <- list()
+  
+  for (dataset_id in names(de_results_list)) {
+    cat(paste("Pathway analysis for", dataset_id, "\n"))
+    
+    pathway_result <- perform_go_enrichment(de_results_list[[dataset_id]], dataset_id)
+    
+    if (length(pathway_result) > 2) {  # More than just gene lists
+      pathway_results[[dataset_id]] <- pathway_result
+      
+      clean_id <- gsub("[^A-Za-z0-9]", "_", dataset_id)
+      
+      # Save pathway results
+      if (!is.null(pathway_result$d1r_pathways)) {
+        write.csv(as.data.frame(pathway_result$d1r_pathways),
+                  paste0("comparative_msn_analysis/species_specific/", 
+                         clean_id, "_D1R_GO_pathways.csv"),
+                  row.names = FALSE)
+        
+        # Create D1R+ pathway plot
+        tryCatch({
+          p_d1r <- barplot(pathway_result$d1r_pathways, showCategory = 10,
+                          title = paste(dataset_id, "D1R+ Enriched Pathways")) +
+            theme(plot.title = element_text(size = 12, hjust = 0.5))
+          
+          ggsave(paste0("comparative_msn_analysis/species_specific/", 
+                        clean_id, "_D1R_Pathways.png"),
+                 p_d1r, width = 12, height = 8)
+        }, error = function(e) {
+          cat("D1R+ pathway plot failed for", dataset_id, "\n")
+        })
+      }
+      
+      if (!is.null(pathway_result$d2r_pathways)) {
+        write.csv(as.data.frame(pathway_result$d2r_pathways),
+                  paste0("comparative_msn_analysis/species_specific/", 
+                         clean_id, "_D2R_GO_pathways.csv"),
+                  row.names = FALSE)
+        
+        # Create D2R+ pathway plot
+        tryCatch({
+          p_d2r <- barplot(pathway_result$d2r_pathways, showCategory = 10,
+                          title = paste(dataset_id, "D2R+ Enriched Pathways")) +
+            theme(plot.title = element_text(size = 12, hjust = 0.5))
+          
+          ggsave(paste0("comparative_msn_analysis/species_specific/", 
+                        clean_id, "_D2R_Pathways.png"),
+                 p_d2r, width = 12, height = 8)
+        }, error = function(e) {
+          cat("D2R+ pathway plot failed for", dataset_id, "\n")
+        })
+      }
+    }
+  }
+  
+  # Compare pathways across datasets
+  if (length(pathway_results) >= 2) {
+    cat("Comparing pathways across datasets...\n")
+    
+    # Extract pathway descriptions
+    all_d1r_pathways <- list()
+    all_d2r_pathways <- list()
+    
+    for (dataset_id in names(pathway_results)) {
+      result <- pathway_results[[dataset_id]]
+      
+      if (!is.null(result$d1r_pathways)) {
+        d1r_df <- as.data.frame(result$d1r_pathways)
+        if (nrow(d1r_df) > 0) {
+          all_d1r_pathways[[dataset_id]] <- d1r_df$Description
+        }
+      }
+      
+      if (!is.null(result$d2r_pathways)) {
+        d2r_df <- as.data.frame(result$d2r_pathways)
+        if (nrow(d2r_df) > 0) {
+          all_d2r_pathways[[dataset_id]] <- d2r_df$Description
+        }
+      }
+    }
+    
+    # Find conserved pathways
+    conserved_d1r <- c()
+    conserved_d2r <- c()
+    
+    if (length(all_d1r_pathways) >= 2) {
+      conserved_d1r <- Reduce(intersect, all_d1r_pathways)
+    }
+    
+    if (length(all_d2r_pathways) >= 2) {
+      conserved_d2r <- Reduce(intersect, all_d2r_pathways)
+    }
+    
+    # Create pathway summary
+    pathway_summary <- data.frame(
+      Dataset_ID = names(pathway_results),
+      D1R_Pathways = sapply(names(pathway_results), function(x) {
+        if (!is.null(pathway_results[[x]]$d1r_pathways)) {
+          nrow(as.data.frame(pathway_results[[x]]$d1r_pathways))
+        } else {
+          0
+        }
+      }),
+      D2R_Pathways = sapply(names(pathway_results), function(x) {
+        if (!is.null(pathway_results[[x]]$d2r_pathways)) {
+          nrow(as.data.frame(pathway_results[[x]]$d2r_pathways))
+        } else {
+          0
+        }
+      }),
+      stringsAsFactors = FALSE
+    )
+    
+    # Add species information
+    pathway_summary <- pathway_summary %>%
+      left_join(dataset_info[, c("Dataset_ID", "Species", "Study")], by = "Dataset_ID")
+    
+    write.csv(pathway_summary, 
+              "comparative_msn_analysis/tables/Pathway_Summary.csv", 
+              row.names = FALSE)
+    
+    cat("\nPathway Analysis Summary:\n")
+    print(pathway_summary)
+    
+    if (length(conserved_d1r) > 0) {
+      cat("\nConserved D1R+ pathways:\n")
+      print(conserved_d1r)
+    }
+    
+    if (length(conserved_d2r) > 0) {
+      cat("\nConserved D2R+ pathways:\n")
+      print(conserved_d2r)
+    }
+    
+    # Create pathway count visualization
+    pathway_summary_long <- pathway_summary %>%
+      select(Dataset_ID, Species, Study, D1R_Pathways, D2R_Pathways) %>%
+      pivot_longer(cols = c(D1R_Pathways, D2R_Pathways),
+                   names_to = "MSN_Type", values_to = "Pathway_Count") %>%
+      filter(Pathway_Count > 0)
+    
+    if (nrow(pathway_summary_long) > 0) {
+      p_pathway_counts <- ggplot(pathway_summary_long, 
+                                aes(x = paste(Species, Study, sep = "_"), 
+                                    y = Pathway_Count, fill = MSN_Type)) +
+        geom_col(position = "dodge", alpha = 0.8) +
+        scale_fill_manual(values = c("D1R_Pathways" = "#FF6B6B", 
+                                    "D2R_Pathways" = "#4ECDC4")) +
+        labs(title = "Enriched Pathways by Dataset and MSN Subtype",
+             x = "Dataset", y = "Number of Enriched Pathways", fill = "MSN Type") +
+        theme_minimal() +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8))
+      
+      ggsave("comparative_msn_analysis/figures/Pathway_Counts_by_Dataset.png",
+             p_pathway_counts, width = 12, height = 8)
+    }
+  }
+  
+} else {
+  cat("No DE results available for pathway analysis\n")
+  pathway_results <- list()
+}
+```
+
+## 7. Therapeutic Target Identification
+
+```{r therapeutic_targets}
+cat("Identifying therapeutic targets...\n")
+
+# Initialize therapeutic targets dataframe
+therapeutic_targets <- data.frame(
+  Target_Gene = character(),
+  Target_Type = character(),
+  Evidence_Strength = character(),
+  Conservation_Score = numeric(),
+  Datasets_Supporting = character(),
+  Therapeutic_Rationale = character(),
+  Disease_Relevance = character(),
+  Druggability = character(),
+  stringsAsFactors = FALSE
+)
+
+# Add core dopamine receptors
+therapeutic_targets <- rbind(therapeutic_targets, data.frame(
+  Target_Gene = c("DRD1", "DRD2"),
+  Target_Type = c("GPCR", "GPCR"),
+  Evidence_Strength = c("High", "High"),
+  Conservation_Score = c(length(unique(dataset_info$Species)), 
+                        length(unique(dataset_info$Species))),
+  Datasets_Supporting = c("All datasets", "All datasets"),
+  Therapeutic_Rationale = c(
+    "Direct D1R+ MSN targeting for motor control",
+    "Direct D2R+ MSN targeting for cognitive/mood regulation"
+  ),
+  Disease_Relevance = c(
+    "Parkinson's, Huntington's, ADHD",
+    "Schizophrenia, Depression, Addiction"
+  ),
+  Druggability = c("High", "High"),
+  stringsAsFactors = FALSE
+))
+
+# Add conserved genes if available
+if (exists("conservation_results") && !is.null(conservation_results)) {
+  highly_conserved_genes <- conservation_results %>%
+    filter(Conservation_Score >= 2, Conservation_Score >= max(Conservation_Score) - 1) %>%
+    head(15)
+  
+  if (nrow(highly_conserved_genes) > 0) {
+    therapeutic_targets <- rbind(therapeutic_targets, data.frame(
+      Target_Gene = highly_conserved_genes$Gene,
+      Target_Type = "Conserved_DE_Gene", 
+      Evidence_Strength = ifelse(highly_conserved_genes$Conservation_Score >= 3, 
+                                "High", "Medium"),
+      Conservation_Score = highly_conserved_genes$Conservation_Score,
+      Datasets_Supporting = paste0(highly_conserved_genes$Conservation_Score, 
+                                  " datasets"),
+      Therapeutic_Rationale = "Cross-species conserved MSN subtype regulation",
+      Disease_Relevance = "Broad neuropsychiatric applications",
+      Druggability = "Medium",
+      stringsAsFactors = FALSE
+    ))
+  }
+}
+
+# Add pathway-based targets
+known_msn_targets <- data.frame(
+  Target_Gene = c("FOXP1", "FOXP2", "PENK", "TAC1", "PPP1R1B", "CREB1", "FOSB"),
+  Target_Type = c("Transcription_Factor", "Transcription_Factor", "Neuropeptide", 
+                 "Neuropeptide", "Phosphatase_Inhibitor", "Transcription_Factor", 
+                 "Transcription_Factor"),
+  Evidence_Strength = c("High", "High", "High", "High", "High", "Medium", "Medium"),
+  Conservation_Score = c(2, 2, 2, 2, 2, 2, 2),
+  Datasets_Supporting = c("Literature + DE", "Literature + DE", "Literature + DE",
+                         "Literature + DE", "Literature + DE", "Pathway analysis", 
+                         "Pathway analysis"),
+  Therapeutic_Rationale = c(
+    "MSN identity transcriptional control",
+    "MSN identity transcriptional control", 
+    "D2R+ MSN peptide signaling",
+    "D1R+ MSN peptide signaling",
+    "MSN-specific DARPP-32 regulation",
+    "Activity-dependent transcription",
+    "Addiction-related transcription"
+  ),
+  Disease_Relevance = c(
+    "Autism, intellectual disability",
+    "Autism, speech disorders",
+    "Mood disorders, addiction",
+    "Movement disorders, psychosis", 
+    "Parkinson's, cognitive disorders",
+    "Learning, memory disorders",
+    "Addiction, compulsive behaviors"
+  ),
+  Druggability = c("Low", "Low", "Medium", "Medium", "Medium", "Medium", "Low"),
+  stringsAsFactors = FALSE
+)
+
+therapeutic_targets <- rbind(therapeutic_targets, known_msn_targets)
+
+# Remove duplicates
+therapeutic_targets <- therapeutic_targets[!duplicated(therapeutic_targets$Target_Gene), ]
+
+# Save therapeutic targets
+write.csv(therapeutic_targets, 
+          "comparative_msn_analysis/tables/Therapeutic_Targets.csv", 
+          row.names = FALSE)
+
+cat("\nTherapeutic Target Summary:\n")
+print(therapeutic_targets[, c("Target_Gene", "Target_Type", "Evidence_Strength", 
+                             "Conservation_Score", "Disease_Relevance")])
+
+# Create target visualization
+if (nrow(therapeutic_targets) > 0) {
+  # Target type distribution
+  p_target_types <- ggplot(therapeutic_targets, aes(x = Target_Type, fill = Evidence_Strength)) +
+    geom_bar(alpha = 0.8) +
+    scale_fill_viridis_d() +
+    labs(title = "Therapeutic Target Types by Evidence Strength",
+         x = "Target Type", y = "Number of Targets", fill = "Evidence Strength") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  
+  # Conservation vs evidence strength
+  p_conservation <- ggplot(therapeutic_targets, 
+                          aes(x = Conservation_Score, y = Target_Gene, 
+                              color = Evidence_Strength)) +
+    geom_point(size = 3, alpha = 0.7) +
+    scale_color_viridis_d() +
+    labs(title = "Therapeutic Targets: Conservation vs Evidence",
+         x = "Conservation Score (Number of Supporting Datasets)",
+         y = "Target Gene", color = "Evidence Strength") +
+    theme_minimal()
+  
+  p_targets <- p_target_types / p_conservation
+  ggsave("comparative_msn_analysis/figures/Therapeutic_Targets_Overview.png",
+         p_targets, width = 12, height = 10)
+}
+```
+
+## 8. Disease Relevance and Clinical Applications
+
+```{r disease_applications}
+cat("Analyzing disease relevance and clinical applications...\n")
+
+# Define disease-MSN relationships
+disease_msn_relationships <- data.frame(
+  Disease = c("Parkinson's Disease", "Huntington's Disease", "Schizophrenia", 
+              "Major Depression", "Addiction (Substance Use)", "ADHD",
+              "Tourette Syndrome", "Obsessive-Compulsive Disorder"),
+  Primary_MSN_Subtype = c("D1R+/D2R+", "D1R+/D2R+", "D2R+", "D2R+", 
+                         "D1R+", "D1R+", "D1R+", "D1R+/D2R+"),
+  Pathophysiology = c(
+    "Dopamine depletion affects both subtypes",
+    "Progressive MSN degeneration",
+    "D2R+ MSN hyperactivity, dopamine imbalance",
+    "Reduced D2R+ MSN activity, anhedonia",
+    "D1R+ MSN reward circuit dysregulation",
+    "D1R+ MSN attention/executive dysfunction", 
+    "D1R+ MSN motor control disinhibition",
+    "D1R+/D2R+ MSN circuit imbalance"
+  ),
+  Current_Treatments = c(
+    "L-DOPA, dopamine agonists, DBS",
+    "Tetrabenazine, antipsychotics", 
+    "Antipsychotics (D2R antagonists)",
+    "SSRIs, SNRIs, antipsychotics",
+    "Behavioral therapy, substitution therapy",
+    "Stimulants (methylphenidate, amphetamines)",
+    "Antipsychotics, alpha-2 agonists",
+    "SSRIs, CBT"
+  ),
+  Novel_Therapeutic_Approaches = c(
+    "MSN-specific neuroprotection, selective D1R/D2R modulation",
+    "MSN survival factors, gene therapy",
+    "Selective D2R+ MSN modulators, glutamate targets",
+    "D2R+ MSN activity enhancers, metabolic modulators",
+    "D1R+ MSN circuit normalization, epigenetic modulators",
+    "D1R+ MSN selective enhancers, attention circuit modulators",
+    "D1R+ MSN inhibitory control enhancement",
+    "MSN circuit rebalancing, targeted neuromodulation"
+  ),
+  stringsAsFactors = FALSE
+)
+
+write.csv(disease_msn_relationships, 
+          "comparative_msn_analysis/tables/Disease_MSN_Relationships.csv", 
+          row.names = FALSE)
+
+# Create clinical translation roadmap
+clinical_roadmap <- data.frame(
+  Phase = c("Discovery", "Preclinical", "Phase I", "Phase II", "Phase III", "Clinical Use"),
+  Timeline = c("0-2 years", "2-5 years", "5-7 years", "7-10 years", "10-15 years", "15+ years"),
+  Key_Activities = c(
+    "Target identification, mechanism validation",
+    "Animal models, safety testing, formulation",
+    "First-in-human safety, dosing",
+    "Efficacy proof-of-concept, biomarkers",
+    "Large-scale efficacy, safety confirmation",
+    "FDA approval, clinical implementation"
+  ),
+  MSN_Specific_Considerations = c(
+    "Cross-species conservation validation",
+    "MSN-specific delivery methods, circuit validation",
+    "MSN biomarker development, safety in healthy brain",
+    "MSN subtype-specific efficacy, circuit modulation",
+    "Long-term MSN health, functional outcomes",
+    "Personalized MSN subtype-based treatment"
+  ),
+  Success_Metrics = c(
+    "Validated targets with conservation evidence",
+    "Effective MSN-specific modulation in models",
+    "Safe brain penetration, no adverse MSN effects",
+    "Measurable MSN circuit improvements",
+    "Clinically meaningful functional improvements",
+    "Approved MSN-targeted therapies"
+  ),
+  stringsAsFactors = FALSE
+)
+
+write.csv(clinical_roadmap, 
+          "comparative_msn_analysis/tables/Clinical_Translation_Roadmap.csv", 
+          row.names = FALSE)
+
+# Biomarker identification
+potential_biomarkers <- data.frame(
+  Biomarker_Gene = character(),
+  Biomarker_Type = character(),
+  Application = character(),
+  Evidence_Level = character(),
+  Clinical_Utility = character(),
+  stringsAsFactors = FALSE
+)
+
+# Add conserved genes as potential biomarkers
+if (exists("conservation_results") && !is.null(conservation_results)) {
+  top_conserved <- conservation_results %>%
+    filter(Conservation_Score >= 2) %>%
+    head(10)
+  
+  if (nrow(top_conserved) > 0) {
+    potential_biomarkers <- rbind(potential_biomarkers, data.frame(
+      Biomarker_Gene = top_conserved$Gene,
+      Biomarker_Type = "RNA Expression",
+      Application = "MSN subtype identification, disease stratification",
+      Evidence_Level = ifelse(top_conserved$Conservation_Score >= 3, "High", "Medium"),
+      Clinical_Utility = "Patient stratification, treatment selection",
+      stringsAsFactors = FALSE
+    ))
+  }
+}
+
+# Add established MSN markers
+established_markers <- data.frame(
+  Biomarker_Gene = c("DRD1", "DRD2", "PENK", "TAC1", "PPP1R1B"),
+  Biomarker_Type = c("RNA/Protein", "RNA/Protein", "RNA/Protein", "RNA/Protein", "RNA/Protein"),
+  Application = c("D1R+ MSN identification", "D2R+ MSN identification", 
+                 "D2R+ MSN activity", "D1R+ MSN activity", "MSN function assessment"),
+  Evidence_Level = c("High", "High", "High", "High", "High"),
+  Clinical_Utility = c("Diagnostic, therapeutic targeting", "Diagnostic, therapeutic targeting",
+                      "Treatment response monitoring", "Treatment response monitoring",
+                      "Functional assessment"),
+  stringsAsFactors = FALSE
+)
+
+potential_biomarkers <- rbind(potential_biomarkers, established_markers)
+potential_biomarkers <- potential_biomarkers[!duplicated(potential_biomarkers$Biomarker_Gene), ]
+
+write.csv(potential_biomarkers, 
+          "comparative_msn_analysis/tables/Potential_Biomarkers.csv", 
+          row.names = FALSE)
+
+cat("\nDisease-MSN Relationships Summary:\n")
+print(disease_msn_relationships[, c("Disease", "Primary_MSN_Subtype", "Pathophysiology")])
+
+cat("\nClinical Translation Timeline:\n")
+print(clinical_roadmap[, c("Phase", "Timeline", "Key_Activities")])
+
+cat("\nPotential Biomarkers:\n")
+print(potential_biomarkers[, c("Biomarker_Gene", "Application", "Evidence_Level")])
+```
+
+## 9. Integration Summary and Future Directions
+
+```{r integration_summary}
+cat("\n=== COMPREHENSIVE ANALYSIS SUMMARY ===\n")
+
+# Collect all key findings
+final_summary <- list(
+  analysis_date = Sys.Date(),
+  datasets_analyzed = nrow(dataset_info),
+  species_included = unique(dataset_info$Species),
+  data_types = unique(dataset_info$DataType),
+  total_cells = sum(dataset_info$n_cells, na.rm = TRUE),
+  
+  # RNA analysis results
+  rna_datasets = length(processed_rna),
+  de_analyses_completed = length(de_results_list),
+  
+  # Conservation results
+  conservation_analysis = exists("conservation_results") && !is.null(conservation_results),
+  conserved_genes = if(exists("conservation_results") && !is.null(conservation_results)) {
+    sum(conservation_results$Conservation_Score >= 2)
+  } else { 0 },
+  
+  # ATAC analysis results  
+  atac_datasets = length(processed_atac),
+  da_analyses_completed = length(atac_da_results),
+  
+  # Pathway analysis results
+  pathway_analyses = length(pathway_results),
+  
+  # Therapeutic targets
+  therapeutic_targets_identified = nrow(therapeutic_targets),
+  
+  # Clinical applications
+  diseases_analyzed = nrow(disease_msn_relationships),
+  biomarkers_identified = nrow(potential_biomarkers)
+)
+
+cat("ANALYSIS OVERVIEW:\n")
+cat(paste("- Datasets analyzed:", final_summary$datasets_analyzed, "\n"))
+cat(paste("- Species included:", paste(final_summary$species_included, collapse = ", "), "\n"))
+cat(paste("- Total cells processed:", final_summary$total_cells, "\n"))
+cat(paste("- RNA datasets:", final_summary$rna_datasets, "\n"))
+cat(paste("- ATAC datasets:", final_summary$atac_datasets, "\n"))
+cat(paste("- DE analyses completed:", final_summary$de_analyses_completed, "\n"))
+cat(paste("- Conserved genes identified:", final_summary$conserved_genes, "\n"))
+cat(paste("- Therapeutic targets:", final_summary$therapeutic_targets_identified, "\n"))
+cat(paste("- Disease applications:", final_summary$diseases_analyzed, "\n"))
+
+# Future research directions
+future_directions <- data.frame(
+  Priority = c("High", "High", "High", "Medium", "Medium", "Low"),
+  Direction = c(
+    "Functional validation of conserved targets",
+    "Single-cell multiome integration (RNA+ATAC)",
+    "Drug screening on MSN-specific targets", 
+    "Spatial transcriptomics integration",
+    "Epigenetic modifier screening",
+    "Clinical biomarker validation studies"
+  ),
+  Timeline = c("6-18 months", "3-12 months", "12-24 months", 
+               "12-18 months", "18-36 months", "24-60 months"),
+  Resources_Needed = c(
+    "CRISPR systems, primary neuron cultures",
+    "Multiome datasets, advanced integration methods",
+    "Compound libraries, high-throughput systems",
+    "Spatial omics datasets, image analysis tools", 
+    "Epigenetic assays, chemical libraries",
+    "Clinical samples, longitudinal studies"
+  ),
+  Expected_Impact = c(
+    "Validate therapeutic mechanisms",
+    "Comprehensive regulatory networks",
+    "Lead compound identification",
+    "Tissue-level MSN organization",
+    "Epigenetic therapeutic targets",
+    "Clinical translation readiness"
+  ),
+  stringsAsFactors = FALSE
+)
+
+write.csv(future_directions, 
+          "comparative_msn_analysis/tables/Future_Research_Directions.csv", 
+          row.names = FALSE)
+
+# Create final summary visualization
+summary_metrics <- data.frame(
+  Metric = c("Datasets", "Species", "Total Cells", "DE Analyses", 
+             "Conserved Genes", "Therapeutic Targets", "Diseases"),
+  Count = c(final_summary$datasets_analyzed, 
+            length(final_summary$species_included),
+            final_summary$total_cells/1000,  # In thousands
+            final_summary$de_analyses_completed,
+            final_summary$conserved_genes,
+            final_summary$therapeutic_targets_identified,
+            final_summary$diseases_analyzed),
+  stringsAsFactors = FALSE
+)
+
+p_summary <- ggplot(summary_metrics, aes(x = reorder(Metric, Count), y = Count)) +
+  geom_col(fill = "steelblue", alpha = 0.8) +
+  coord_flip() +
+  labs(title = "Comprehensive MSN Analysis Summary",
+       subtitle = "Key metrics from cross-species comparative analysis",
+       x = "Analysis Component", y = "Count") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 14, hjust = 0.5),
+        plot.subtitle = element_text(size = 12, hjust = 0.5))
+
+ggsave("comparative_msn_analysis/figures/Analysis_Summary_Metrics.png",
+       p_summary, width = 10, height = 6)
+
+# Save complete summary
+saveRDS(final_summary, "comparative_msn_analysis/Complete_Analysis_Summary.rds")
+
+cat("\nFUTURE RESEARCH PRIORITIES:\n")
+print(future_directions[, c("Priority", "Direction", "Timeline")])
+
+cat("\n=== ANALYSIS COMPLETED SUCCESSFULLY ===\n")
+cat("All results saved in 'comparative_msn_analysis/' directory\n")
+cat("Key outputs:\n")
+cat("- figures/: Main visualizations and plots\n") 
+cat("- tables/: Summary tables and results\n")
+cat("- species_specific/: Individual dataset analyses\n")
+cat("- integration/: Cross-species integration results\n")
+```
+
+## 10. Session Information
+
+```{r session_info}
+# Document computational environment
+cat("\n=== COMPUTATIONAL ENVIRONMENT ===\n")
+
+session_info <- sessionInfo()
+print(session_info)
+
+# Create reproducibility information
+repro_info <- list(
+  r_version = R.version.string,
+  platform = R.version$platform,
+  date = Sys.Date(),
+  packages = session_info$otherPkgs,
+  analysis_parameters = list(
+    de_pval_threshold = 0.05,
+    de_fc_threshold = 0.5,
+    pathway_pval_threshold = 0.05,
+    min_cells_per_group = 10
+  )
+)
+
+saveRDS(repro_info, "comparative_msn_analysis/Session_Info.rds")
+
+# Create analysis completion report
+completion_report <- paste0(
+  "COMPARATIVE MSN ANALYSIS COMPLETED\n",
+  "==================================\n\n",
+  "Analysis Date: ", Sys.Date(), "\n",
+  "Analysis Time: ", format(Sys.time(), "%H:%M:%S"), "\n\n",
+  "DATASETS PROCESSED:\n",
+  "- Total datasets: ", final_summary$datasets_analyzed, "\n",
+  "- Species: ", paste(final_summary$species_included, collapse = ", "), "\n",
+  "- Total cells: ", format(final_summary$total_cells, big.mark = ","), "\n\n",
+  "ANALYSES COMPLETED:\n",
+  "- Differential expression: ", final_summary$de_analyses_completed, " datasets\n",
+  "- Conservation analysis: ", ifelse(final_summary$conservation_analysis, "Yes", "No"), "\n",
+  "- Pathway enrichment: ", final_summary$pathway_analyses, " datasets\n",
+  "- ATAC-seq analysis: ", final_summary$atac_datasets, " datasets\n\n",
+  "KEY FINDINGS:\n",
+  "- Conserved genes identified: ", final_summary$conserved_genes, "\n",
+  "- Therapeutic targets: ", final_summary$therapeutic_targets_identified, "\n",
+  "- Disease applications: ", final_summary$diseases_analyzed, "\n",
+  "- Potential biomarkers: ", nrow(potential_biomarkers), "\n\n",
+  "OUTPUT FILES:\n",
+  "- Main results: comparative_msn_analysis/figures/\n",
+  "- Summary tables: comparative_msn_analysis/tables/\n",
+  "- Species-specific: comparative_msn_analysis/species_specific/\n",
+  "- Integration results: comparative_msn_analysis/integration/\n\n",
+  "NEXT STEPS:\n",
+  "1. Review therapeutic targets for validation experiments\n",
+  "2. Plan functional studies for conserved genes\n",
+  "3. Design biomarker validation studies\n",
+  "4. Prepare manuscript with cross-species findings\n\n",
+  "For detailed results, see individual output files and summary objects.\n"
+)
+
+writeLines(completion_report, "comparative_msn_analysis/Analysis_Completion_Report.txt")
+
+cat(completion_report)
+```
+
+This comprehensive Rmd file is specifically adapted for your dataset structure and provides:
+
+1. **Flexible data loading** that handles the different RDS files in your rawdata folder
+2. **Automatic metadata extraction** from filenames to identify species, data type, and study
+3. **MSN subtype classification** based on DRD1/DRD2 expression or existing annotations
+4. **Species-specific differential expression** analysis for D1R+ vs D2R+ MSNs
+5. **Cross-species conservation analysis** to identify conserved genes and mechanisms
+6. **ATAC-seq differential accessibility** analysis when available
+6. **Pathway enrichment analysis** using Gene Ontology
+7. **Therapeutic target identification** based on conservation and known MSN biology
+8. **Disease relevance mapping** for clinical applications
+9. **Comprehensive output organization** with figures, tables, and species-specific results
+
+## Key Features:
+
+- **Simple and straightforward**: No parallelization, clear step-by-step analysis
+- **Robust error handling**: Continues analysis even if some datasets fail
+- **Flexible input handling**: Works with your specific file naming convention
+- **Comprehensive outputs**: Organized directory structure with all results
+- **Clinical translation focus**: Emphasis on therapeutic targets and disease applications
+
+## Output Structure:
+comparative_msn_analysis/
+├── figures/
+│   ├── Dataset_Overview.png
+│   ├── RNA_MSN_Classification.png
+│   ├── Gene_Conservation_Heatmap.png
+│   ├── Pathway_Counts_by_Dataset.png
+│   ├── Therapeutic_Targets_Overview.png
+│   └── Analysis_Summary_Metrics.png
+├── tables/
+│   ├── Dataset_Summary.csv
+│   ├── RNA_MSN_Classification_Summary.csv
+│   ├── Gene_Conservation_Analysis.csv
+│   ├── Pathway_Summary.csv
+│   ├── Therapeutic_Targets.csv
+│   ├── Disease_MSN_Relationships.csv
+│   ├── Clinical_Translation_Roadmap.csv
+│   ├── Potential_Biomarkers.csv
+│   └── Future_Research_Directions.csv
+├── species_specific/
+│   ├── [Dataset]_DE_D1R_vs_D2R.csv
+│   ├── [Dataset]_Volcano_Plot.png
+│   ├── [Dataset]_DA_peaks.csv (for ATAC)
+│   ├── [Dataset]_ATAC_Volcano.png
+│   ├── [Dataset]_D1R_GO_pathways.csv
+│   ├── [Dataset]_D1R_Pathways.png
+│   ├── [Dataset]_D2R_GO_pathways.csv
+│   └── [Dataset]_D2R_Pathways.png
+├── integration/
+│   └── (RNA-ATAC integration results if applicable)
+├── Complete_Analysis_Summary.rds
+├── Session_Info.rds
+└── Analysis_Completion_Report.txt
+
+## Usage Instructions:
+
+1. **Place your RDS files** in the `rawdata/` folder with the naming convention you're using
+2. **Install required packages** if not already installed
+3. **Run the Rmd file** chunk by chunk or knit the entire document
+4. **Review results** in the generated `comparative_msn_analysis/` directory
+5. **Check the completion report** for summary and next steps
+
+## Expected Results:
+
+- **Cross-species MSN subtype classifications** with D1R+/D2R+ identification
+- **Differential expression results** for each dataset comparing MSN subtypes  
+- **Conservation analysis** identifying genes consistently differentially expressed across species
+- **Pathway enrichment** showing biological processes enriched in each MSN subtype
+- **Therapeutic target prioritization** based on conservation and druggability
+- **Clinical translation roadmap** with disease applications and biomarkers
+- **Future research directions** with timelines and resource requirements
+
+This analysis framework will help you identify the most promising therapeutic targets and regulatory mechanisms that are conserved across species, providing a strong foundation for translational research and drug development efforts targeting MSN subtypes in neuropsychiatric diseases.

@@ -13,5 +13,3 @@ GSE167920 - https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE167920
 - Pathway enrichment using `clusterProfiler`
 - Epigenetic regulator analysis
 
-## How to Run
-Open `Dopamine_MSN_Epigenetics.Rproj` in RStudio and knit `scnuclei_reanalysis.Rmd`.

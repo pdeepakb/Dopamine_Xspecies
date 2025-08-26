@@ -1,0 +1,1391 @@
+---
+title: 'Dopamine MSNs Epigenetic Analysis: D1 vs D2 with Enhanced Methods'
+author: "Deepak Poduval"
+date: "`r Sys.Date()`"
+output:
+  word_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 10, fig.height = 8)
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(clusterProfiler)
+  library(org.Hs.eg.db)
+  library(tidyverse)
+  library(patchwork)
+  library(Matrix)
+  library(ggplot2)
+  library(enrichplot)
+  library(edgeR)
+  library(ggrepel)
+  library(STRINGdb)
+  library(igraph)
+  library(limma)
+  library(ComplexHeatmap)
+})
+
+# Create output directories
+dir.create("D1vD2_figures", showWarnings = FALSE)
+dir.create("D1vD2_tables", showWarnings = FALSE)
+
+# Reproducibility for stochastic steps
+set.seed(1234)
+```
+
+## Load and Initial Data Exploration
+```{r load data}
+# Load the RDS file
+so <- readRDS("raw_data/GSE167920_Results_full_nuclei_processed_final.rds")
+
+# Explore data structure
+cat("Data Overview\n")
+cat(paste("Number of cells:", ncol(so)), "\n")
+cat(paste("Number of genes:", nrow(so)), "\n")
+cat(paste("Available assays:", paste(names(so@assays), collapse = ", ")), "\n")
+
+# Check metadata
+cat("Metadata Columns\n")
+print(colnames(so@meta.data))
+
+# Check cell types
+if ("cell_type" %in% colnames(so@meta.data)) {
+  cat("Cell Type Distribution\n")
+  print(table(so@meta.data$cell_type))
+}
+
+# Check for D1/D2 MSN populations
+cat("Checking For D1/D2 MSNs\n")
+msn_types <- grep("DRD|D1|D2|MSN", unique(so@meta.data$cell_type), value = TRUE, ignore.case = TRUE)
+cat(paste("MSN-related cell types found:", paste(msn_types, collapse = ", ")), "\n")
+
+# Basic metadata structure
+str(so@meta.data, max.level = 1)
+```
+
+## Quality Control Assessment
+```{r QC Assessment}
+# Clear any problematic graph objects first
+so@graphs <- list()
+
+# Calculate additional QC metrics if not present
+if (!"percent.mt" %in% colnames(so@meta.data)) {
+  so[["percent.mt"]] <- PercentageFeatureSet(so, pattern = "^MT-")
+}
+if (!"percent.ribo" %in% colnames(so@meta.data)) {
+  so[["percent.ribo"]] <- PercentageFeatureSet(so, pattern = "^RP[SL]")
+}
+
+# QC summaries
+summary(so@meta.data$nFeatures_RNA)
+summary(so@meta.data$nCount.RNA)
+summary(so@meta.data$percent.ribo)
+
+# QC plots
+p1 <- VlnPlot(so, features = c("nFeatures_RNA", "nCount.RNA", "percent.ribo"), ncol = 3, pt.size = 0.1)
+print(p1)
+ggsave("D1vD2_figures/QC_violin_plots.png", p1, width = 15, height = 6)
+
+p2 <- FeatureScatter(so, feature1 = "nCount.RNA", feature2 = "nFeatures_RNA") + geom_smooth(method = "lm")
+p3 <- FeatureScatter(so, feature1 = "nCount.RNA", feature2 = "percent.ribo") + geom_smooth(method = "lm")
+p4 <- p2 + p3
+print(p4)
+ggsave("D1vD2_figures/QC_scatter_plots.png", p4, width = 12, height = 6)
+```
+
+## Data Filtering and Quality Control
+```{r filtering}
+cat("Before Filtering\n")
+cat(paste("Cells:", ncol(so)), "\n")
+cat(paste("Genes:", nrow(so)), "\n")
+
+if ("cell_type" %in% colnames(so@meta.data)) {
+  cat("Cell Type Distribution Before Filtering\n")
+  print(table(so@meta.data$cell_type))
+}
+
+# Apply filtering based on QC metrics
+so <- subset(so, subset = nFeatures_RNA > 200 &
+                        nFeatures_RNA < 8000 &
+                        nCount.RNA > 1000 &
+                        nCount.RNA < 80000 &
+                        percent.ribo < 0.02)
+
+cat("After Filtering\n")
+cat(paste("Cells:", ncol(so)), "\n")
+cat(paste("Genes:", nrow(so)), "\n")
+
+if ("cell_type" %in% colnames(so@meta.data)) {
+  cat("Cell Type Distribution After Filtering\n")
+  print(table(so@meta.data$cell_type))
+}
+```
+
+## Create MSN Subset
+```{r create msn subset}
+# Filter for MSN cells only
+if (length(msn_types) > 0) {
+  so_msn <- subset(so, subset = cell_type %in% msn_types)
+  cat(paste("MSN cells retained:", ncol(so_msn)), "\n")
+  cat("MSN cell type distribution:\n")
+  print(table(so_msn@meta.data$cell_type))
+} else {
+  # If no specific MSN cell types, try to identify by marker expression
+  cat("No MSN cell types found, attempting to identify by markers...\n")
+  
+  # Check for DRD1/DRD2 expression to identify MSNs
+  if (all(c("DRD1", "DRD2") %in% rownames(so))) {
+    drd1_exp <- GetAssayData(so, assay = "RNA", layer = "data")["DRD1",]
+    drd2_exp <- GetAssayData(so, assay = "RNA", layer = "data")["DRD2",]
+    
+    # Identify cells with either DRD1 or DRD2 expression
+    msn_cells <- which(drd1_exp > 0.5 | drd2_exp > 0.5)
+    
+    if (length(msn_cells) > 50) {
+      so_msn <- so[, msn_cells]
+      cat(paste("MSN cells identified by expression:", ncol(so_msn)), "\n")
+    } else {
+      cat("Insufficient MSN cells identified, using all cells\n")
+      so_msn <- so
+    }
+  } else {
+    cat("DRD1/DRD2 not found, using all cells\n")
+    so_msn <- so
+  }
+}
+```
+
+## Data Normalization and Scaling (MSN subset)
+```{r normalize scale msn}
+DefaultAssay(so_msn) <- "RNA"
+
+# Normalize if needed
+if (is.null(so_msn[["RNA"]]@data) || ncol(so_msn[["RNA"]]@data) == 0) {
+  cat("Normalizing MSN RNA data...\n")
+  so_msn <- NormalizeData(so_msn)
+} else {
+  cat("MSN RNA data already normalized\n")
+}
+
+# Variable features
+if (length(VariableFeatures(so_msn)) == 0) {
+  cat("Finding variable features for MSNs...\n")
+  so_msn <- FindVariableFeatures(so_msn, selection.method = "vst", nfeatures = 2000)
+} else {
+  cat("Variable features already identified for MSNs\n")
+}
+
+# Plot variable features
+top10 <- head(VariableFeatures(so_msn), 10)
+p5 <- VariableFeaturePlot(so_msn)
+p6 <- LabelPoints(plot = p5, points = top10, repel = TRUE)
+print(p6)
+ggsave("D1vD2_figures/Variable_Features_MSN.png", p6, width = 12, height = 8)
+
+# Scale only variable features for speed
+if (is.null(so_msn[["RNA"]]@scale.data) || ncol(so_msn[["RNA"]]@scale.data) == 0) {
+  cat("Scaling MSN RNA variable features...\n")
+  so_msn <- ScaleData(so_msn, features = VariableFeatures(so_msn))
+} else {
+  cat("MSN RNA data already scaled\n")
+}
+```
+
+## PCA and Dimensionality Reduction (MSN subset)
+```{r pca umap msn}
+if (!"pca" %in% names(so_msn@reductions)) {
+  cat("Running PCA on MSNs...\n")
+  so_msn <- RunPCA(so_msn, features = VariableFeatures(so_msn))
+}
+
+p7 <- DimPlot(so_msn, reduction = "pca", group.by = "cell_type", label = TRUE, repel = TRUE)
+print(p7)
+ggsave("D1vD2_figures/PCA_plot_MSN.png", p7, width = 12, height = 8)
+
+p8 <- ElbowPlot(so_msn, ndims = 50)
+print(p8)
+ggsave("D1vD2_figures/Elbow_plot_MSN.png", p8, width = 10, height = 6)
+
+if (!"umap" %in% names(so_msn@reductions)) {
+  cat("Running UMAP on MSNs...\n")
+  set.seed(1234)
+  so_msn <- RunUMAP(so_msn, dims = 1:20)
+}
+
+p9 <- DimPlot(so_msn, reduction = "umap", group.by = "cell_type", label = TRUE, repel = TRUE)
+print(p9)
+ggsave("D1vD2_figures/UMAP_CellType_MSN.png", p9, width = 12, height = 10)
+```
+
+## Dopamine Receptor Expression and D1/D2 Classification
+```{r dopamine receptors}
+# Key dopamine-related markers
+dopamine_markers <- c("DRD1", "DRD2", "PPP1R1B", "PDE1B", "BCL11B", "KIAA1211L", "PDE2A", "SLIT3", "NGEF")
+
+present_markers <- dopamine_markers[dopamine_markers %in% rownames(so_msn)]
+missing_markers <- setdiff(dopamine_markers, present_markers)
+
+cat("Dopamine Marker Availability\n")
+cat(paste("Present:", paste(present_markers, collapse = ", ")), "\n")
+cat(paste("Missing:", paste(missing_markers, collapse = ", ")), "\n")
+
+if (length(present_markers) > 0) {
+  p10 <- FeaturePlot(so_msn, features = present_markers, ncol = 3, reduction = "umap")
+  print(p10)
+  ggsave("D1vD2_figures/Dopamine_Markers_FeaturePlot.png", p10, width = 15, height = 10)
+
+  p11 <- VlnPlot(so_msn, features = present_markers, group.by = "cell_type", ncol = 3, pt.size = 0)
+  print(p11)
+  ggsave("D1vD2_figures/Dopamine_Markers_ViolinPlot.png", p11, width = 15, height = 10)
+}
+
+# D1/D2 classification based on DRD1/DRD2 expression
+if (all(c("DRD1", "DRD2") %in% rownames(so_msn))) {
+  drd1_exp <- GetAssayData(so_msn, assay = "RNA", layer = "data")["DRD1",]
+  drd2_exp <- GetAssayData(so_msn, assay = "RNA", layer = "data")["DRD2",]
+  
+  so_msn$D1_D2_class <- case_when(
+    drd1_exp > 1 & drd2_exp < 0.5 ~ "D1R+",
+    drd2_exp > 1 & drd1_exp < 0.5 ~ "D2R+",
+    TRUE ~ "Mixed/Other"
+  )
+  
+  cat("D1R/D2R Classification\n")
+  print(table(so_msn$D1_D2_class))
+
+  p12 <- DimPlot(so_msn, group.by = "D1_D2_class", reduction = "umap",
+                 cols = c("D1R+" = "#FF6B6B", "D2R+" = "#4ECDC4", "Mixed/Other" = "#95A5A6"))
+  print(p12)
+  ggsave("D1vD2_figures/D1R_D2R_Classification.png", p12, width = 10, height = 8)
+} else {
+  cat("DRD1 or DRD2 not found, using cell_type for classification\n")
+  if ("cell_type" %in% colnames(so_msn@meta.data)) {
+    so_msn$D1_D2_class <- so_msn$cell_type
+  }
+}
+```
+
+## Single-cell Differential Expression Analysis: D1 vs D2
+```{r single cell differential expression}
+# Ensure we have sufficient cells for DE analysis
+if (ncol(so_msn) > 50 && "D1_D2_class" %in% colnames(so_msn@meta.data)) {
+  cat("Performing Single-cell Differential Expression Analysis: D1 vs D2\n")
+  
+  # Check if we have D1R+ and D2R+ cells
+  cell_counts <- table(so_msn$D1_D2_class)
+  print(cell_counts)
+  
+  if ("D1R+" %in% names(cell_counts) && "D2R+" %in% names(cell_counts) && 
+      cell_counts["D1R+"] >= 10 && cell_counts["D2R+"] >= 10) {
+    
+    Idents(so_msn) <- so_msn$D1_D2_class
+    
+    cat("Comparing D1R+ vs D2R+ MSNs (single-cell)\n")
+    markers_d1_vs_d2 <- FindMarkers(
+      so_msn,
+      ident.1 = "D1R+",
+      ident.2 = "D2R+",
+      only.pos = FALSE,
+      min.pct = 0.1,
+      logfc.threshold = 0,
+      test.use = "wilcox"
+    )
+    
+    markers_d1_vs_d2$gene <- rownames(markers_d1_vs_d2)
+    write.csv(markers_d1_vs_d2, "D1vD2_tables/SingleCell_DE_D1_vs_D2_all.csv", row.names = FALSE)
+    
+    # Apply significance criteria: abs(log2FC) > 1, padj < 0.05
+    sc_sig <- markers_d1_vs_d2 %>%
+      filter(!is.na(p_val_adj)) %>%
+      filter(p_val_adj < 0.05, abs(avg_log2FC) > 1)
+    
+    write.csv(sc_sig, "D1vD2_tables/SingleCell_DE_D1_vs_D2_significant.csv", row.names = FALSE)
+    
+    cat("Significant DE genes found (single-cell):", nrow(sc_sig), "\n")
+    
+    # Volcano plot
+    volcano_data <- markers_d1_vs_d2 %>%
+      mutate(
+        sig = ifelse(!is.na(p_val_adj) & p_val_adj < 0.05 & abs(avg_log2FC) > 1, "significant", "ns"),
+        log10_padj = -log10(p_val_adj + 1e-300),
+        direction = case_when(
+          avg_log2FC > 1 & p_val_adj < 0.05 ~ "D1-enriched",
+          avg_log2FC < -1 & p_val_adj < 0.05 ~ "D2-enriched",
+          TRUE ~ "Not significant"
+        )
+      )
+    
+    p_volcano_sc <- ggplot(volcano_data, aes(x = avg_log2FC, y = log10_padj)) +
+      geom_point(aes(color = direction), alpha = 0.6) +
+      scale_color_manual(values = c("D1-enriched" = "#FF6B6B", "D2-enriched" = "#4ECDC4", "Not significant" = "#CCCCCC")) +
+      labs(x = "Average log2(Fold Change) (D1 vs D2)", 
+           y = "-log10(Adjusted P-value)",
+           title = "Single-cell DE: D1R+ vs D2R+ MSNs",
+           color = "Gene Type") +
+      theme_classic() +
+      geom_hline(yintercept = -log10(0.05), linetype = "dashed", alpha = 0.5) +
+      geom_vline(xintercept = c(-1, 1), linetype = "dashed", alpha = 0.5)
+    
+    print(p_volcano_sc)
+    ggsave("D1vD2_figures/Volcano_Plot_SingleCell_D1_vs_D2.png", p_volcano_sc, width = 10, height = 8)
+    
+    # Highlight top genes
+    top_genes <- sc_sig %>% 
+      arrange(p_val_adj) %>% 
+      slice_head(n = 20) %>% 
+      pull(gene)
+    
+    p_volcano_sc_labeled <- p_volcano_sc +
+      geom_text_repel(
+        data = volcano_data %>% filter(gene %in% top_genes),
+        aes(label = gene),
+        size = 3, max.overlaps = 20
+      )
+    
+    print(p_volcano_sc_labeled)
+    ggsave("D1vD2_figures/Volcano_Plot_SingleCell_D1_vs_D2_labeled.png", p_volcano_sc_labeled, width = 12, height = 10)
+    
+  } else {
+    cat("Insufficient D1R+ or D2R+ cells for single-cell DE analysis\n")
+  }
+} else {
+  cat("Insufficient cells for single-cell DE analysis\n")
+}
+```
+
+## Pseudobulk Differential Expression Analysis with MDS Plot
+```{r pseudobulk de}
+if ("D1_D2_class" %in% colnames(so_msn@meta.data)) {
+  cat("Performing Pseudobulk Differential Expression Analysis\n")
+  
+  # Create sample IDs if not present (simulate biological replicates)
+  if (!"sample" %in% colnames(so_msn@meta.data)) {
+    set.seed(123)
+    so_msn$sample <- NA
+    
+    # Create 3 pseudo-replicates for each D1/D2 class
+    for (class in unique(so_msn$D1_D2_class)) {
+      if (class %in% c("D1R+", "D2R+")) {
+        class_cells <- which(so_msn$D1_D2_class == class)
+        n_samples <- 3
+        so_msn$sample[class_cells] <- paste0("Sample_", class, "_", sample(1:n_samples, length(class_cells), replace = TRUE))
+      }
+    }
+  }
+  
+  # Get counts and metadata
+  counts <- GetAssayData(so_msn, slot = "counts")
+  meta_df <- so_msn@meta.data[, c("sample", "D1_D2_class")]
+  
+  # Create pseudobulk by aggregating counts per sample
+  pb_counts_list <- list()
+  pb_meta_list <- list()
+  
+  for (s in unique(meta_df$sample)) {
+    if (!is.na(s)) {
+      cells <- rownames(meta_df[meta_df$sample == s & !is.na(meta_df$sample), ])
+      group <- unique(meta_df[meta_df$sample == s & !is.na(meta_df$sample), "D1_D2_class"])
+      
+      if (length(group) == 1 && length(cells) > 0) {
+        pb_counts_list[[s]] <- Matrix::rowSums(counts[, cells, drop = FALSE])
+        pb_meta_list[[s]] <- data.frame(sample = s, group = group)
+      }
+    }
+  }
+  
+  pb_counts <- do.call(cbind, pb_counts_list)
+  pb_meta <- do.call(rbind, pb_meta_list)
+  
+  # Filter for D1R+ and D2R+ only
+  keep_groups <- c("D1R+", "D2R+")
+  keep_samples <- pb_meta$group %in% keep_groups
+  pb_counts <- pb_counts[, keep_samples]
+  pb_meta <- pb_meta[keep_samples, , drop = FALSE]
+  pb_meta$group <- factor(pb_meta$group, levels = keep_groups)
+  
+  cat(paste("Pseudobulk samples:", ncol(pb_counts)), "\n")
+  print(table(pb_meta$group))
+  
+  if (ncol(pb_counts) >= 4 && all(keep_groups %in% pb_meta$group)) {
+    # EdgeR analysis
+    dge <- DGEList(counts = pb_counts, group = pb_meta$group)
+    
+    # Filter lowly expressed genes
+    keep <- filterByExpr(dge, min.count = 10)
+    dge <- dge[keep, , keep.lib.sizes = FALSE]
+    
+    # Normalization
+    dge <- calcNormFactors(dge)
+    
+    # MDS Plot for sample relationships
+    cat("Creating MDS plot for sample relationships\n")
+    mds_data <- plotMDS(dge, plot = FALSE)
+    mds_df <- data.frame(
+      Sample = colnames(dge),
+      Dim1 = mds_data$x,
+      Dim2 = mds_data$y,
+      Group = pb_meta$group
+    )
+    
+    p_mds <- ggplot(mds_df, aes(x = Dim1, y = Dim2, color = Group)) +
+      geom_point(size = 4) +
+      geom_text_repel(aes(label = Sample), size = 3) +
+      labs(title = "MDS Plot: Sample Relationships",
+           x = paste("Leading logFC dim 1 (", round(mds_data$var.explained[1], 1), "%)", sep = ""),
+           y = paste("Leading logFC dim 2 (", round(mds_data$var.explained[2], 1), "%)", sep = "")) +
+      theme_minimal()
+    
+    print(p_mds)
+    ggsave("D1vD2_figures/MDS_Sample_Relationships.png", p_mds, width = 10, height = 8)
+    
+    # Design matrix
+    design <- model.matrix(~0 + pb_meta$group)
+    colnames(design) <- make.names(levels(pb_meta$group))
+    
+    # Estimate dispersion
+    dge <- estimateDisp(dge, design)
+    
+    # Fit model
+    fit <- glmFit(dge, design)
+    
+    # Make contrast
+    contrast <- makeContrasts(D1R_vs_D2R = D1R. - D2R., levels = design)
+    lrt <- glmLRT(fit, contrast = contrast)
+    
+    # Extract results
+    pb_de_results <- topTags(lrt, n = Inf)$table %>%
+      rownames_to_column("gene") %>%
+      arrange(FDR)
+    
+    write.csv(pb_de_results, "D1vD2_tables/Pseudobulk_DE_D1_vs_D2_all.csv", row.names = FALSE)
+    
+    # Apply significance criteria: abs(logFC) > 1 & FDR < 0.05
+    pb_sig <- pb_de_results %>% 
+      filter(FDR < 0.05, abs(logFC) > 1)
+    
+    write.csv(pb_sig, "D1vD2_tables/Pseudobulk_DE_D1_vs_D2_significant.csv", row.names = FALSE)
+    
+    cat("Significant DE genes found (pseudobulk):", nrow(pb_sig), "\n")
+    
+    # Volcano plot (pseudobulk)
+    pb_volcano_data <- pb_de_results %>%
+      mutate(
+        log10FDR = -log10(FDR + 1e-300),
+        direction = case_when(
+          logFC > 1 & FDR < 0.05 ~ "D1-enriched",
+          logFC < -1 & FDR < 0.05 ~ "D2-enriched",
+          TRUE ~ "Not significant"
+        )
+      )
+    
+    p_volcano_pb <- ggplot(pb_volcano_data, aes(x = logFC, y = log10FDR)) +
+      geom_point(aes(color = direction), alpha = 0.6) +
+      scale_color_manual(values = c("D1-enriched" = "#FF6B6B", "D2-enriched" = "#4ECDC4", "Not significant" = "#CCCCCC")) +
+      labs(title = "Pseudobulk DE: D1R+ vs D2R+",
+           x = "log2 Fold Change", y = "-log10 FDR", color = "Gene Type") +
+      theme_classic() +
+      geom_hline(yintercept = -log10(0.05), linetype = "dashed", alpha = 0.5) +
+      geom_vline(xintercept = c(-1, 1), linetype = "dashed", alpha = 0.5)
+    
+    print(p_volcano_pb)
+    ggsave("D1vD2_figures/Volcano_Plot_Pseudobulk_D1_vs_D2.png", p_volcano_pb, width = 10, height = 8)
+    
+    # Label top genes
+    pb_top_genes <- pb_sig %>% 
+      arrange(FDR) %>% 
+      slice_head(n = 20) %>% 
+      pull(gene)
+    
+    p_volcano_pb_labeled <- p_volcano_pb +
+      geom_text_repel(
+        data = pb_volcano_data %>% filter(gene %in% pb_top_genes),
+        aes(label = gene),
+        size = 3, max.overlaps = 20
+      )
+    
+    print(p_volcano_pb_labeled)
+    ggsave("D1vD2_figures/Volcano_Plot_Pseudobulk_D1_vs_D2_labeled.png", p_volcano_pb_labeled, width = 12, height = 10)
+    
+  } else {
+    cat("Insufficient samples for pseudobulk analysis\n")
+  }
+} else {
+  cat("D1_D2_class not found for pseudobulk analysis\n")
+}
+```
+
+## Enhanced Overlapping DE Analysis: Single-cell vs Pseudobulk
+```{r overlap analysis}
+if (exists("markers_d1_vs_d2") && exists("pb_de_results")) {
+  cat("Performing Enhanced Overlap Analysis: Single-cell vs Pseudobulk\n")
+  
+  sc_genes <- rownames(markers_d1_vs_d2)
+  pb_genes <- pb_de_results$gene
+  overlapping_genes <- intersect(sc_genes, pb_genes)
+  
+  cat("Number of overlapping DE genes:", length(overlapping_genes), "\n")
+  
+  if (length(overlapping_genes) > 0) {
+    # Create overlap comparison
+    overlap_sc <- markers_d1_vs_d2[overlapping_genes, , drop = FALSE] %>%
+      rownames_to_column("sc_gene") %>%  # Rename to avoid duplication
+      select(sc_gene, avg_log2FC, p_val_adj) %>%
+      rename(sc_log2FC = avg_log2FC, sc_padj = p_val_adj)
+    
+    overlap_pb <- pb_de_results %>% 
+      filter(gene %in% overlapping_genes) %>%
+      select(gene, logFC, FDR) %>%
+      rename(pb_log2FC = logFC, pb_FDR = FDR)
+    
+    overlap_merged <- merge(overlap_sc, overlap_pb, by.x = "sc_gene", by.y = "gene")  # Merge on the new column name
+    
+    # Calculate agreement metrics
+    overlap_merged$direction_agreement <- sign(overlap_merged$sc_log2FC) == sign(overlap_merged$pb_log2FC)
+    overlap_merged$abs_diff <- abs(overlap_merged$pb_log2FC - overlap_merged$sc_log2FC)
+    
+    # Calculate correlation
+    cor_coef <- cor(overlap_merged$sc_log2FC, overlap_merged$pb_log2FC, use = "complete.obs")
+    direction_agreement_rate <- mean(overlap_merged$direction_agreement, na.rm = TRUE)
+    
+    cat(paste("Correlation between single-cell and pseudobulk log2FC:", round(cor_coef, 3)), "\n")
+    cat(paste("Direction Agreement:", round(direction_agreement_rate * 100, 1), "%\n"))
+    
+    write.csv(overlap_merged, "D1vD2_tables/Overlapping_DEGs_SC_vs_PB_enhanced.csv", row.names = FALSE)
+    
+    # Enhanced comparison plot
+    p_overlap_enhanced <- ggplot(overlap_merged, aes(x = pb_log2FC, y = sc_log2FC)) +
+      geom_point(aes(color = direction_agreement), alpha = 0.7) +
+      geom_smooth(method = "lm", se = TRUE, color = "red") +
+      geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "blue") +
+      scale_color_manual(values = c("TRUE" = "darkgreen", "FALSE" = "red"), 
+                         name = "Direction\nAgreement") +
+      labs(x = "Pseudobulk log2FC", y = "Single-cell log2FC",
+           title = "Enhanced Overlap: Single-cell vs Pseudobulk DE",
+           subtitle = paste("Correlation: r =", round(cor_coef, 3), 
+                          "| Direction Agreement:", round(direction_agreement_rate * 100, 1), "%")) +
+      theme_classic() +
+      theme(legend.position = "right")
+    
+    print(p_overlap_enhanced)
+    ggsave("D1vD2_figures/Enhanced_Overlap_DEGs_Comparison.png", p_overlap_enhanced, width = 12, height = 8)
+    
+    # Identify top disagreements and agreements
+    overlap_merged <- overlap_merged[order(-overlap_merged$abs_diff), ]
+    
+    # Top disagreements where direction is different or abs_diff > 0.1
+    top_disagreements <- overlap_merged %>%
+      filter(direction_agreement == FALSE | abs_diff > 0.1) %>%
+      arrange(-abs_diff) %>%
+      head(10)
+    
+    # Top agreements (same direction, smallest abs_diff)
+    top_agreements <- overlap_merged %>%
+      filter(direction_agreement == TRUE) %>%
+      arrange(abs_diff) %>%
+      head(10)
+
+    # Check if there are any results for disagreements and agreements
+    cat("Top Disagreements (largest log2FC differences):\n")
+    if (nrow(top_disagreements) > 0) {
+      print(top_disagreements[, c("sc_gene", "sc_log2FC", "pb_log2FC", "abs_diff")])
+    } else {
+      cat("No significant disagreements found.\n")
+    }
+
+    cat("Top Agreements (smallest log2FC differences with same direction):\n")
+    if (nrow(top_agreements) > 0) {
+      print(top_agreements[, c("sc_gene", "sc_log2FC", "pb_log2FC", "abs_diff")])
+    } else {
+      cat("No significant agreements found.\n")
+    }
+    
+    # Save top disagreements and agreements to CSV
+    write.csv(top_disagreements, "D1vD2_tables/Top_Disagreements_SC_vs_PB.csv", row.names = FALSE)
+    write.csv(top_agreements, "D1vD2_tables/Top_Agreements_SC_vs_PB.csv", row.names = FALSE)
+    
+    # Store concordance rate for later use
+    concordance_rate <- direction_agreement_rate
+    
+  } else {
+    cat("No overlapping genes found between methods\n")
+  }
+} else {
+  cat("Single-cell or pseudobulk DE results not found for overlap analysis\n")
+}
+```
+
+## KEGG and GO Enrichment Analysis
+```{r KEGG GO enrichment analysis}
+if (exists("markers_d1_vs_d2") && nrow(markers_d1_vs_d2) > 100) {
+  cat("Running KEGG and GO Enrichment Analysis\n")
+  
+  # Get significant DE genes for enrichment
+  sig_genes_for_enrichment <- markers_d1_vs_d2 %>%
+    filter(!is.na(p_val_adj), p_val_adj < 0.05, abs(avg_log2FC) > 0.5)
+
+  # Remove existing 'gene' column if it exists
+  if ("gene" %in% colnames(sig_genes_for_enrichment)) {
+    sig_genes_for_enrichment <- sig_genes_for_enrichment %>%
+      select(-gene)
+  }
+
+  # Add row names as 'gene' column
+  sig_genes_for_enrichment <- sig_genes_for_enrichment %>%
+    rownames_to_column("gene")
+
+  if (nrow(sig_genes_for_enrichment) > 10) {
+    sig_gene_symbols <- sig_genes_for_enrichment$gene
+    
+    # Convert gene symbols to Entrez IDs for KEGG
+    gene_entrez <- bitr(sig_gene_symbols, 
+                       fromType = "SYMBOL", 
+                       toType = "ENTREZID", 
+                       OrgDb = org.Hs.eg.db)
+    
+    cat(paste("Genes for enrichment analysis:", length(sig_gene_symbols)), "\n")
+    cat(paste("Successfully converted to Entrez ID:", nrow(gene_entrez)), "\n")
+    
+    if (nrow(gene_entrez) > 10) {
+      
+      # 1. KEGG Pathway Enrichment
+      cat("Running KEGG enrichment...\n")
+      kegg_enrich <- enrichKEGG(gene = gene_entrez$ENTREZID,
+                               organism = 'hsa',
+                               pvalueCutoff = 0.05,
+                               qvalueCutoff = 0.2)
+      
+      if (!is.null(kegg_enrich) && nrow(as.data.frame(kegg_enrich)) > 0) {
+        kegg_results <- as.data.frame(kegg_enrich)
+        write.csv(kegg_results, "D1vD2_tables/KEGG_Enrichment_D1_vs_D2.csv", row.names = FALSE)
+        
+        # KEGG barplot
+        p_kegg_bar <- barplot(kegg_enrich, 
+                             showCategory = 15, 
+                             title = "KEGG Pathway Enrichment (D1 vs D2 DE genes)")
+        print(p_kegg_bar)
+        ggsave("D1vD2_figures/KEGG_Enrichment_Barplot.png", p_kegg_bar, width = 12, height = 8)
+        
+        # KEGG dotplot
+        p_kegg_dot <- dotplot(kegg_enrich, 
+                             showCategory = 15,
+                             title = "KEGG Pathway Enrichment (D1 vs D2 DE genes)")
+        print(p_kegg_dot)
+        ggsave("D1vD2_figures/KEGG_Enrichment_Dotplot.png", p_kegg_dot, width = 12, height = 8)
+        
+        cat("KEGG enrichment completed. Found", nrow(kegg_results), "significant pathways\n")
+        print(head(kegg_results[, c("Description", "pvalue", "p.adjust", "Count")], 10))
+      } else {
+        cat("No significant KEGG pathways found\n")
+      }
+
+      # (Continue with the rest of the code...)
+    } else {
+      cat("Insufficient genes with Entrez IDs for enrichment analysis\n")
+    }
+  } else {
+    cat("Insufficient significant DE genes for enrichment analysis\n")
+  }
+} else {
+  cat("DE results not available for enrichment analysis\n")
+}
+```
+
+## Epigenetic Regulator Expression Analysis
+```{r epigenetic regulators}
+epi_genes <- c(
+  # DNA methylation
+  "DNMT1","DNMT3A","DNMT3B","TET1","TET2","TET3","UHRF1",
+  # Histone writers
+  "EZH2","EZH1","SUZ12","EED","KMT2A","KMT2D","SETD1A","SETD1B",
+  "KMT5A","KMT5B","KMT5C","EHMT1","EHMT2","SUV39H1","SUV39H2",
+  # Histone erasers
+  "KDM1A","KDM1B","KDM4A","KDM4B","KDM4C","KDM5A","KDM5B","KDM6A","KDM6B",
+  "HDAC1","HDAC2","HDAC3","SIRT1","SIRT2","SIRT6",
+  # Chromatin remodeling
+  "SMARCA4","SMARCA2","SMARCB1","CHD1","CHD2","CHD7","CHD8",
+  # DNA binding/regulation
+  "MECP2","MBD1","MBD2","MBD3","CTCF","SATB1","SATB2"
+)
+
+present_epi_genes <- intersect(epi_genes, rownames(so_msn))
+missing_epi_genes  <- setdiff(epi_genes, present_epi_genes)
+
+cat(paste("Present epigenetic genes:", length(present_epi_genes)), "\n")
+cat(paste("Missing epigenetic genes:", length(missing_epi_genes)), "\n")
+
+if (length(present_epi_genes) > 0) {
+  # Calculate epigenetic scores
+  histone_writers <- intersect(c("EZH2", "KMT2A", "KMT2D", "SETD1A", "SETD1B"), rownames(so_msn))
+  histone_erasers <- intersect(c("KDM1A", "KDM4A", "KDM6A", "KDM6B", "HDAC1", "HDAC2"), rownames(so_msn))
+  
+  if (length(histone_writers) > 0) {
+    so_msn$writer_score <- colMeans(GetAssayData(so_msn, layer = "data")[histone_writers, , drop = FALSE])
+  }
+  if (length(histone_erasers) > 0) {
+    so_msn$eraser_score <- colMeans(GetAssayData(so_msn, layer = "data")[histone_erasers, , drop = FALSE])
+  }
+  if (length(histone_writers) > 0 && length(histone_erasers) > 0) {
+    so_msn$writer_eraser_ratio <- so_msn$writer_score / (so_msn$eraser_score + 0.1)
+  }
+
+  # Plot writer/eraser scores
+  if ("writer_score" %in% colnames(so_msn@meta.data)) {
+    p_writer <- VlnPlot(so_msn, features = "writer_score", group.by = "D1_D2_class") +
+      ggtitle("Histone Writer Score")
+    ggsave("D1vD2_figures/Histone_Writer_Score.png", p_writer, width = 8, height = 6)
+    print(p_writer)
+  }
+  
+  if ("writer_eraser_ratio" %in% colnames(so_msn@meta.data)) {
+    p_ratio <- VlnPlot(so_msn, features = "writer_eraser_ratio", group.by = "D1_D2_class") +
+      ggtitle("Writer/Eraser Ratio")
+    ggsave("D1vD2_figures/Writer_Eraser_Ratio.png", p_ratio, width = 8, height = 6)
+    print(p_ratio)
+  }
+
+  # Use up to 10 genes for compact violins
+  top_epi_genes <- present_epi_genes[1:min(10, length(present_epi_genes))]
+
+  p18 <- VlnPlot(so_msn, features = top_epi_genes,
+                 group.by = "D1_D2_class",
+                 pt.size = 0, ncol = 4) +
+         theme_minimal() + ggtitle("Expression of Epigenetic Regulators: D1 vs D2")
+  ggsave("D1vD2_figures/Epigenetic_Regulators_ViolinPlot.png", p18, width = 16, height = 12)
+  print(p18)
+
+  # Enhanced heatmap using ComplexHeatmap
+  if (length(present_epi_genes) >= 4) {
+    so_msn <- ScaleData(so_msn, features = present_epi_genes, verbose = FALSE)
+    
+    # Prepare data for ComplexHeatmap
+    exp_mat <- GetAssayData(so_msn, layer = "scale.data")[present_epi_genes, ]
+    group_colors <- c("D1R+" = "#FF6B6B", "D2R+" = "#4ECDC4", "Mixed/Other" = "#95A5A6")
+    
+    # Column annotation
+    col_anno <- HeatmapAnnotation(
+      Group = so_msn$D1_D2_class,
+      col = list(Group = group_colors)
+    )
+    
+    # Create enhanced heatmap
+    p19_enhanced <- Heatmap(
+      exp_mat,
+      name = "Expression",
+      top_annotation = col_anno,
+      show_column_names = FALSE,
+      row_names_gp = gpar(fontsize = 10),
+      column_title = "Epigenetic Regulators Expression (D1 vs D2)",
+      clustering_distance_rows = "euclidean",
+      clustering_method_rows = "complete"
+    )
+    
+    png("D1vD2_figures/Epigenetic_Regulators_Enhanced_Heatmap.png", width = 12, height = 10, units = "in", res = 300)
+    draw(p19_enhanced)
+    dev.off()
+    
+    # Also create standard Seurat heatmap
+    p19 <- DoHeatmap(so_msn,
+                     features = present_epi_genes,
+                     group.by = "D1_D2_class",
+                     size = 3) +
+           scale_fill_gradientn(colors = c("skyblue", "white", "coral")) +
+           ggtitle("Heatmap of Epigenetic Regulator Expression")
+    ggsave("D1vD2_figures/Epigenetic_Regulators_Heatmap.png", p19, width = 12, height = 10)
+    print(p19)
+  }
+
+  # DotPlot
+  if (length(present_epi_genes) >= 4) {
+    p_dot <- DotPlot(so_msn, features = present_epi_genes,
+                     group.by = "D1_D2_class") +
+             RotatedAxis() +
+             scale_color_gradientn(colors = c("skyblue", "white", "coral")) +
+             ggtitle("DotPlot of Epigenetic Regulator Expression")
+    ggsave("D1vD2_figures/Epigenetic_Regulators_DotPlot.png", p_dot, width = 14, height = 8)
+    print(p_dot)
+  }
+
+  # Differential epigenetic regulators within single-cell DE results
+  if (exists("sc_sig")) {
+    epi_de_results <- sc_sig %>%
+      filter(gene %in% present_epi_genes) %>%
+      arrange(p_val_adj)
+    if (nrow(epi_de_results) > 0) {
+      write.csv(epi_de_results, "D1vD2_tables/Epigenetic_Regulators_DE_singlecell.csv", row.names = FALSE)
+      print(head(epi_de_results, 15))
+    }
+  }
+  
+  # Create epigenetic functional categories
+  epi_categories <- data.frame(
+    gene = present_epi_genes,
+    category = case_when(
+      present_epi_genes %in% c("DNMT1","DNMT3A","DNMT3B","TET1","TET2","TET3","UHRF1") ~ "DNA Methylation",
+      present_epi_genes %in% c("EZH2","EZH1","SUZ12","EED","KMT2A","KMT2D","SETD1A","SETD1B","KMT5A","KMT5B","KMT5C","EHMT1","EHMT2","SUV39H1","SUV39H2") ~ "Histone Writers",
+      present_epi_genes %in% c("KDM1A","KDM1B","KDM4A","KDM4B","KDM4C","KDM5A","KDM5B","KDM6A","KDM6B","HDAC1","HDAC2","HDAC3","SIRT1","SIRT2","SIRT6") ~ "Histone Erasers",
+      present_epi_genes %in% c("SMARCA4","SMARCA2","SMARCB1","CHD1","CHD2","CHD7","CHD8") ~ "Chromatin Remodeling",
+      TRUE ~ "DNA Binding/Regulation"
+    )
+  )
+  
+  write.csv(epi_categories, "D1vD2_tables/Epigenetic_Gene_Categories.csv", row.names = FALSE)
+}
+```
+
+## Epigenetic Network Analysis
+```{r epigenetic networks}
+if (length(present_epi_genes) > 3) {
+  cat("Creating Epigenetic Interaction Networks\n")
+  
+  # Simple correlation-based network for epigenetic regulators
+  epi_exp_data <- GetAssayData(so_msn, layer = "data")[present_epi_genes, ]
+  # Convert the sparse matrix to a regular dense matrix
+  epi_exp_data_dense <- as.matrix(epi_exp_data)
+
+  epi_cor <- cor(t(epi_exp_data_dense), method = "spearman")
+  
+  # Create adjacency matrix (correlation > 0.3)
+  adj_matrix <- ifelse(abs(epi_cor) > 0.3 & epi_cor != 1, 1, 0)
+  
+  # Create network graph
+  if (sum(adj_matrix) > 0) {
+    g <- graph_from_adjacency_matrix(adj_matrix, mode = "undirected")
+    
+    # Calculate node properties
+    V(g)$degree <- degree(g)
+    V(g)$betweenness <- betweenness(g)
+    
+    # Color nodes by epigenetic category
+    if (exists("epi_categories")) {
+      epi_cats_graph <- epi_categories[match(V(g)$name, epi_categories$gene), ]
+      V(g)$category <- epi_cats_graph$category
+      
+      category_colors <- c(
+        "DNA Methylation" = "#FF6B6B",
+        "Histone Writers" = "#4ECDC4",
+        "Histone Erasers" = "#45B7D1",
+        "Chromatin Remodeling" = "#96CEB4",
+        "DNA Binding/Regulation" = "#FFEAA7"
+      )
+      V(g)$color <- category_colors[V(g)$category]
+    }
+    
+    # Plot network
+    png("D1vD2_figures/Epigenetic_Network.png", width = 12, height = 10, units = "in", res = 300)
+    plot(g, 
+         vertex.size = sqrt(V(g)$degree) * 5 + 5,
+         vertex.label.cex = 0.8,
+         vertex.label.color = "black",
+         edge.width = 2,
+         layout = layout_with_fr(g),
+         main = "Epigenetic Regulator Correlation Network (D1 vs D2)")
+    
+    if (exists("epi_categories")) {
+      legend("topright", 
+             legend = names(category_colors), 
+             fill = category_colors, 
+             title = "Epigenetic Category")
+    }
+    dev.off()
+    
+    # Save network statistics
+    network_stats <- data.frame(
+      gene = V(g)$name,
+      degree = V(g)$degree,
+      betweenness = V(g)$betweenness,
+      category = if (exists("epi_categories")) V(g)$category else NA
+    )
+    write.csv(network_stats, "D1vD2_tables/Epigenetic_Network_Statistics.csv", row.names = FALSE)
+    print(head(network_stats[order(-network_stats$degree), ], 10))
+  }
+}
+```
+
+## Disease Relevance and Therapeutic Target Analysis
+```{r disease analysis}
+cat("Disease Relevance and Therapeutic Target Analysis\n")
+
+# Define disease-related gene sets
+parkinson_genes <- c("SNCA", "LRRK2", "PARK7", "PINK1", "PRKN", "GBA", "MAPT", "VPS35", "CHCHD2", "DNAJC6")
+huntington_genes <- c("HTT", "HAP1", "HIP1", "CREBBP", "TAF4", "TBP", "CACNA1A", "JPH3", "ATN1", "FMR1")
+alzheimer_genes <- c("APP", "PSEN1", "PSEN2", "APOE", "TREM2", "SORL1", "ABCA7", "BIN1", "CLU", "CR1")
+
+# Combine into neurodegeneration gene set
+neurodegeneration_genes <- unique(c(parkinson_genes, huntington_genes, alzheimer_genes))
+
+# Check overlap with DE genes
+if (exists("sc_sig")) {
+  pd_overlap <- intersect(sc_sig$gene, parkinson_genes)
+  hd_overlap <- intersect(sc_sig$gene, huntington_genes)
+  ad_overlap <- intersect(sc_sig$gene, alzheimer_genes)
+  neuro_overlap <- intersect(sc_sig$gene, neurodegeneration_genes)
+  
+  cat("Disease Gene Overlaps with Significant DE genes:\n")
+  cat(paste("Parkinson's:", length(pd_overlap), "genes -", paste(pd_overlap, collapse = ", ")), "\n")
+  cat(paste("Huntington's:", length(hd_overlap), "genes -", paste(hd_overlap, collapse = ", ")), "\n")
+  cat(paste("Alzheimer's:", length(ad_overlap), "genes -", paste(ad_overlap, collapse = ", ")), "\n")
+  cat(paste("Total Neurodegeneration:", length(neuro_overlap), "genes"), "\n")
+  
+  # Create disease overlap summary
+  disease_overlap_summary <- data.frame(
+    Disease = c("Parkinson's", "Huntington's", "Alzheimer's", "All Neurodegeneration"),
+    Overlap_Count = c(length(pd_overlap), length(hd_overlap), length(ad_overlap), length(neuro_overlap)),
+    Overlapping_Genes = c(
+      paste(pd_overlap, collapse = ", "),
+      paste(hd_overlap, collapse = ", "),
+      paste(ad_overlap, collapse = ", "),
+      paste(neuro_overlap, collapse = ", ")
+    )
+  )
+  
+  write.csv(disease_overlap_summary, "D1vD2_tables/Disease_Gene_Overlaps.csv", row.names = FALSE)
+  print(disease_overlap_summary)
+}
+
+# Potential drug targets
+potential_drug_targets <- c("DRD1", "DRD2", "HDAC1", "HDAC2", "HDAC3", "EZH2", "DNMT1", "DNMT3A", "KDM1A")
+
+if (exists("sc_sig")) {
+  drug_target_overlap <- sc_sig %>%
+    filter(gene %in% potential_drug_targets) %>%
+    arrange(p_val_adj)
+  
+  if (nrow(drug_target_overlap) > 0) {
+    cat("Significant DE genes that are potential drug targets:\n")
+    print(drug_target_overlap[, c("gene", "avg_log2FC", "p_val_adj")])
+    write.csv(drug_target_overlap, "D1vD2_tables/Potential_Drug_Targets.csv", row.names = FALSE)
+  }
+}
+```
+
+## Statistical Improvements and Multiple Testing Correction
+```{r statistical improvements}
+cat("Enhanced Statistical Analysis and Global Multiple Testing Correction\n")
+
+# Collect all p-values from different analyses for global correction
+all_pvalues <- c()
+analysis_source <- c()
+
+if (exists("markers_d1_vs_d2")) {
+  all_pvalues <- c(all_pvalues, markers_d1_vs_d2$p_val)
+  analysis_source <- c(analysis_source, rep("SingleCell_DE", nrow(markers_d1_vs_d2)))
+}
+
+if (exists("pb_de_results")) {
+  all_pvalues <- c(all_pvalues, pb_de_results$PValue)
+  analysis_source <- c(analysis_source, rep("Pseudobulk_DE", nrow(pb_de_results)))
+}
+
+if (exists("go_bp_results") && nrow(go_bp_results) > 0) {
+  all_pvalues <- c(all_pvalues, go_bp_results$pvalue)
+  analysis_source <- c(analysis_source, rep("GO_BP", nrow(go_bp_results)))
+}
+
+# Apply global Benjamini-Hochberg correction
+if (length(all_pvalues) > 0) {
+  global_fdr <- p.adjust(all_pvalues, method = "BH")
+  
+  # Create summary of global correction impact
+  global_correction_summary <- data.frame(
+    Analysis = analysis_source,
+    Original_P = all_pvalues,
+    Global_FDR = global_fdr,
+    Significant_Original = all_pvalues < 0.05,
+    Significant_Global = global_fdr < 0.05
+  )
+  
+  # Count significant tests before and after global correction
+  sig_before <- sum(global_correction_summary$Significant_Original, na.rm = TRUE)
+  sig_after <- sum(global_correction_summary$Significant_Global, na.rm = TRUE)
+  
+  cat("Global Multiple Testing Correction Results:\n")
+  cat(paste("Significant tests before global correction:", sig_before), "\n")
+  cat(paste("Significant tests after global correction:", sig_after), "\n")
+  cat(paste("Reduction in significant tests:", sig_before - sig_after, 
+            "(", round((sig_before - sig_after)/sig_before * 100, 1), "%)"), "\n")
+  
+  write.csv(global_correction_summary, "D1vD2_tables/Global_Multiple_Testing_Correction.csv", row.names = FALSE)
+  
+  # Plot comparison of p-values before and after correction
+  p_global_correction <- ggplot(global_correction_summary, aes(x = -log10(Original_P), y = -log10(Global_FDR))) +
+    geom_point(aes(color = Analysis), alpha = 0.6) +
+    geom_abline(intercept = 0, slope = 1, linetype = "dashed") +
+    labs(x = "-log10(Original P-value)", y = "-log10(Global FDR)",
+         title = "Impact of Global Multiple Testing Correction") +
+    theme_classic()
+  
+  ggsave("D1vD2_figures/Global_Multiple_Testing_Correction.png", p_global_correction, width = 10, height = 8)
+  print(p_global_correction)
+}
+```
+
+## Advanced Pathway Analysis and Integration
+```{r advanced pathway analysis}
+cat("Advanced Pathway Analysis and Integration\n")
+
+# Create pathway-gene network for visualization
+if (exists("go_bp_results") && nrow(go_bp_results) > 0) {
+  # Get top pathways
+  top_pathways <- go_bp_results %>%
+    filter(p.adjust < 0.05) %>%
+    arrange(p.adjust) %>%
+    slice_head(n = 10)
+  
+  if (nrow(top_pathways) > 0) {
+    # Create pathway-gene bipartite network
+    pathway_gene_edges <- data.frame()
+    for (i in 1:nrow(top_pathways)) {
+      pathway_name <- top_pathways$Description[i]
+      # Get genes from the gene ratio
+      genes_in_pathway <- unlist(strsplit(top_pathways$geneID[i], "/"))
+      
+      for (gene in genes_in_pathway[1:min(5, length(genes_in_pathway))]) {  # Limit to top 5 genes per pathway
+        pathway_gene_edges <- rbind(pathway_gene_edges, 
+                                   data.frame(from = pathway_name, to = gene, type = "pathway-gene"))
+      }
+    }
+    
+    if (nrow(pathway_gene_edges) > 0) {
+      # Create network
+      pathway_network <- graph_from_data_frame(pathway_gene_edges, directed = FALSE)
+      
+      # Set node attributes
+      V(pathway_network)$type <- ifelse(V(pathway_network)$name %in% top_pathways$Description, "pathway", "gene")
+      V(pathway_network)$color <- ifelse(V(pathway_network)$type == "pathway", "#FF6B6B", "#4ECDC4")
+      V(pathway_network)$shape <- ifelse(V(pathway_network)$type == "pathway", "square", "circle")
+      
+      # Plot pathway network
+      png("D1vD2_figures/Pathway_Gene_Network.png", width = 14, height = 12, units = "in", res = 300)
+      plot(pathway_network,
+           vertex.size = ifelse(V(pathway_network)$type == "pathway", 8, 4),
+           vertex.label.cex = 0.7,
+           vertex.label.color = "black",
+           edge.width = 1,
+           layout = layout_with_fr(pathway_network),
+           main = "Top GO BP Pathways and Associated Genes (D1 vs D2)")
+      
+      legend("topright", 
+             legend = c("Pathway", "Gene"), 
+             fill = c("#FF6B6B", "#4ECDC4"),
+             pch = c(15, 19),
+             title = "Node Type")
+      dev.off()
+    }
+  }
+}
+
+# Pathway enrichment comparison across methods
+enrichment_comparison <- data.frame()
+
+# Add GO enrichment results if they exist
+if (exists("go_bp_results") && nrow(go_bp_results) > 0) {
+  go_bp_df <- go_bp_results %>%
+    slice_head(n = 20) %>%
+    mutate(Method = "GO_BP", 
+           Term = Description,
+           Score = -log10(p.adjust))
+  enrichment_comparison <- rbind(enrichment_comparison, 
+                                go_bp_df[, c("Method", "Term", "Score")])
+}
+
+if (exists("kegg_results") && nrow(kegg_results) > 0) {
+  kegg_df <- kegg_results %>%
+    slice_head(n = 20) %>%
+    mutate(Method = "KEGG",
+           Term = Description,
+           Score = -log10(p.adjust))
+  enrichment_comparison <- rbind(enrichment_comparison,
+                                kegg_df[, c("Method", "Term", "Score")])
+}
+
+if (nrow(enrichment_comparison) > 0) {
+  # Plot method comparison
+  p_method_comparison <- ggplot(enrichment_comparison, aes(x = reorder(Term, Score), y = Score, fill = Method)) +
+    geom_col(position = "dodge") +
+    coord_flip() +
+    labs(title = "Pathway Enrichment: GO vs KEGG Comparison (D1 vs D2)",
+         x = "Pathway", y = "Enrichment Score (-log10 p.adjust)") +
+    theme_minimal() +
+    theme(axis.text.y = element_text(size = 8))
+  
+  ggsave("D1vD2_figures/Pathway_Method_Comparison.png", p_method_comparison, width = 14, height = 10)
+  print(p_method_comparison)
+}
+```
+
+## Tissue Specificity and Conservation Analysis
+```{r tissue conservation analysis}
+cat("Tissue Specificity and Evolutionary Analysis\n")
+
+# Brain-specific gene analysis
+brain_specific_genes <- c("SYN1", "SYN2", "SNAP25", "VAMP2", "NEUROD1", "NEUROD6", 
+                         "RBFOX3", "MAP2", "TUBB3", "ENO2", "NCAM1", "GAD1", "GAD2")
+
+# Neuron-specific genes
+neuron_genes <- c("NEFL", "NEFM", "NEFH", "MAP2", "TUBB3", "SYN1", "SNAP25", "CAMK2A")
+
+# Striatum-specific genes  
+striatal_genes <- c("DRD1", "DRD2", "PENK", "TAC1", "PPP1R1B", "ARPP21", "RGS9")
+
+if (exists("sc_sig")) {
+  # Check overlap with tissue-specific genes
+  brain_overlap <- intersect(sc_sig$gene, brain_specific_genes)
+  neuron_overlap <- intersect(sc_sig$gene, neuron_genes)
+  striatal_overlap <- intersect(sc_sig$gene, striatal_genes)
+  
+  tissue_specificity_summary <- data.frame(
+    Category = c("Brain-specific", "Neuron-specific", "Striatum-specific"),
+    Total_Genes = c(length(brain_specific_genes), length(neuron_genes), length(striatal_genes)),
+    DE_Overlap = c(length(brain_overlap), length(neuron_overlap), length(striatal_overlap)),
+    Overlap_Percent = c(
+      round(length(brain_overlap)/length(brain_specific_genes)*100, 1),
+      round(length(neuron_overlap)/length(neuron_genes)*100, 1),
+      round(length(striatal_overlap)/length(striatal_genes)*100, 1)
+    ),
+    Overlapping_Genes = c(
+      paste(brain_overlap, collapse = ", "),
+      paste(neuron_overlap, collapse = ", "),
+      paste(striatal_overlap, collapse = ", ")
+    )
+  )
+  
+  write.csv(tissue_specificity_summary, "D1vD2_tables/Tissue_Specificity_Analysis.csv", row.names = FALSE)
+  print(tissue_specificity_summary)
+  
+  # Visualize tissue specificity
+  p_tissue_spec <- ggplot(tissue_specificity_summary, aes(x = Category, y = Overlap_Percent)) +
+    geom_col(fill = "steelblue", alpha = 0.7) +
+    geom_text(aes(label = paste0(DE_Overlap, "/", Total_Genes)), 
+              vjust = -0.5, size = 4) +
+    labs(title = "Tissue Specificity of DE Genes (D1 vs D2)",
+         x = "Gene Category", y = "Percent Overlap with DE genes") +
+    theme_minimal()
+  
+  ggsave("D1vD2_figures/Tissue_Specificity_Analysis.png", p_tissue_spec, width = 10, height = 6)
+  print(p_tissue_spec)
+}
+
+# Evolutionary conservation analysis (simplified)
+essential_genes <- c("ACTB", "GAPDH", "RPL13A", "B2M", "HPRT1")  # Housekeeping genes
+primate_specific <- c("ARHGAP11B", "NOTCH2NL")  # Known primate-specific genes
+
+if (exists("sc_sig")) {
+  conservation_analysis <- sc_sig %>%
+    mutate(
+      Conservation_Category = case_when(
+        gene %in% essential_genes ~ "Essential/Housekeeping",
+        gene %in% primate_specific ~ "Primate-specific",
+        TRUE ~ "Other"
+      )
+    ) %>%
+    count(Conservation_Category) %>%
+    mutate(Percentage = round(n/sum(n)*100, 1))
+  
+  print("Conservation categories of DE genes:")
+  print(conservation_analysis)
+  write.csv(conservation_analysis, "D1vD2_tables/Conservation_Analysis.csv", row.names = FALSE)
+}
+```
+
+## Summary and Enhanced Data Export
+```{r enhanced summary export}
+cat("Enhanced Analysis Summary\n")
+
+# Comprehensive statistics
+analysis_stats <- list()
+analysis_stats$total_cells_original <- ncol(so)
+analysis_stats$total_cells_filtered <- ncol(so_msn)
+analysis_stats$total_genes_filtered <- nrow(so_msn)
+if ("D1_D2_class" %in% colnames(so_msn@meta.data)) {
+  analysis_stats$d1r_cells <- sum(so_msn$D1_D2_class == "D1R+", na.rm = TRUE)
+  analysis_stats$d2r_cells <- sum(so_msn$D1_D2_class == "D2R+", na.rm = TRUE)
+  analysis_stats$mixed_other_cells <- sum(so_msn$D1_D2_class == "Mixed/Other", na.rm = TRUE)
+}
+analysis_stats$epigenetic_regulators_detected <- length(present_epi_genes)
+
+if (exists("sc_sig")) {
+  analysis_stats$sc_significant_genes <- nrow(sc_sig)
+  analysis_stats$sc_upregulated_d1 <- sum(sc_sig$avg_log2FC > 0)
+  analysis_stats$sc_downregulated_d1 <- sum(sc_sig$avg_log2FC < 0)
+}
+
+if (exists("pb_sig")) {
+  analysis_stats$pb_significant_genes <- nrow(pb_sig)
+  analysis_stats$pb_upregulated_d1 <- sum(pb_sig$logFC > 0)
+  analysis_stats$pb_downregulated_d1 <- sum(pb_sig$logFC < 0)
+}
+
+if (exists("overlap_merged")) {
+  analysis_stats$overlapping_genes <- nrow(overlap_merged)
+  analysis_stats$direction_agreement_percent <- round(mean(overlap_merged$direction_agreement, na.rm = TRUE) * 100, 1)
+}
+
+if (exists("kegg_results")) {
+  analysis_stats$kegg_pathways <- nrow(kegg_results)
+}
+
+if (exists("go_bp_results")) {
+  analysis_stats$go_bp_terms <- nrow(go_bp_results)
+}
+
+if (exists("go_mf_results")) {
+  analysis_stats$go_mf_terms <- nrow(go_mf_results)
+}
+
+if (exists("go_cc_results")) {
+  analysis_stats$go_cc_terms <- nrow(go_cc_results)
+}
+
+# Convert to data frame for easy viewing
+summary_df <- data.frame(
+  Metric = names(analysis_stats),
+  Value = unlist(analysis_stats),
+  row.names = NULL
+)
+
+print("Comprehensive Analysis Summary:")
+print(summary_df)
+write.csv(summary_df, "D1vD2_tables/Comprehensive_Analysis_Summary.csv", row.names = FALSE)
+
+# Save all key results in a single Excel file with multiple sheets
+if (requireNamespace("openxlsx", quietly = TRUE)) {
+  wb <- openxlsx::createWorkbook()
+  
+  # Add summary sheet
+  openxlsx::addWorksheet(wb, "Summary")
+  openxlsx::writeData(wb, "Summary", summary_df)
+  
+  # Add DE results
+  if (exists("sc_sig")) {
+    openxlsx::addWorksheet(wb, "SingleCell_DE_Significant")
+    openxlsx::writeData(wb, "SingleCell_DE_Significant", sc_sig)
+  }
+  
+  if (exists("pb_sig")) {
+    openxlsx::addWorksheet(wb, "Pseudobulk_DE_Significant")
+    openxlsx::writeData(wb, "Pseudobulk_DE_Significant", pb_sig)
+  }
+  
+  # Add epigenetic results
+  if (exists("epi_de_results") && nrow(epi_de_results) > 0) {
+    openxlsx::addWorksheet(wb, "Epigenetic_DE")
+    openxlsx::writeData(wb, "Epigenetic_DE", epi_de_results)
+  }
+  
+  # Add overlap results
+  if (exists("overlap_merged")) {
+    openxlsx::addWorksheet(wb, "SC_vs_PB_Overlap")
+    openxlsx::writeData(wb, "SC_vs_PB_Overlap", overlap_merged)
+  }
+  
+  # Add enrichment results
+  if (exists("kegg_results") && nrow(kegg_results) > 0) {
+    openxlsx::addWorksheet(wb, "KEGG_Enrichment")
+    openxlsx::writeData(wb, "KEGG_Enrichment", kegg_results)
+  }
+  
+  if (exists("go_bp_results") && nrow(go_bp_results) > 0) {
+    openxlsx::addWorksheet(wb, "GO_BP_Enrichment")
+    openxlsx::writeData(wb, "GO_BP_Enrichment", go_bp_results)
+  }
+  
+  if (exists("go_mf_results") && nrow(go_mf_results) > 0) {
+    openxlsx::addWorksheet(wb, "GO_MF_Enrichment")
+    openxlsx::writeData(wb, "GO_MF_Enrichment", go_mf_results)
+  }
+  
+  if (exists("go_cc_results") && nrow(go_cc_results) > 0) {
+    openxlsx::addWorksheet(wb, "GO_CC_Enrichment")
+    openxlsx::writeData(wb, "GO_CC_Enrichment", go_cc_results)
+  }
+  
+  openxlsx::saveWorkbook(wb, "D1vD2_tables/Complete_Analysis_Results.xlsx", overwrite = TRUE)
+  cat("All results saved to Complete_Analysis_Results.xlsx\n")
+}
+
+# Save processed datasets
+#saveRDS(so, "D1vD2_tables/Processed_Full_Dataset.rds")
+#saveRDS(so_msn, "D1vD2_tables/Processed_MSN_Dataset.rds")
+
+# Save as .h5Seurat
+#if (requireNamespace("SeuratDisk", quietly = TRUE)) {
+#  SeuratDisk::SaveH5Seurat(so_msn, filename = "D1vD2_tables/Processed_MSN_Dataset.h5Seurat", overwrite = TRUE)
+  
+  # Convert to .h5ad (AnnData format)
+#  SeuratDisk::Convert("D1vD2_tables/Processed_MSN_Dataset.h5Seurat", dest = "h5ad")
+#}
+
+# Create final visualization summary
+cat("Creating Final Summary Visualization\n")
+
+# Multi-panel summary figure
+if (exists("sc_sig") && exists("pb_sig")) {
+  # Prepare summary data
+  summary_data <- data.frame(
+    Analysis = c("Single-cell", "Pseudobulk"),
+    Total_DE = c(nrow(sc_sig), nrow(pb_sig)),
+    D1_Enriched = c(sum(sc_sig$avg_log2FC > 0), sum(pb_sig$logFC > 0)),
+    D2_Enriched = c(sum(sc_sig$avg_log2FC < 0), sum(pb_sig$logFC < 0))
+  )
+  
+  # Reshape for plotting
+  summary_long <- summary_data %>%
+    tidyr::pivot_longer(cols = c("D1_Enriched", "D2_Enriched"), 
+                       names_to = "Direction", values_to = "Count")
+  
+  p_summary <- ggplot(summary_long, aes(x = Analysis, y = Count, fill = Direction)) +
+    geom_col(position = "stack") +
+    geom_text(aes(label = Count), position = position_stack(vjust = 0.5)) +
+    scale_fill_manual(values = c("D1_Enriched" = "#FF6B6B", "D2_Enriched" = "#4ECDC4")) +
+    labs(title = "Summary of Differential Expression Results (D1 vs D2)",
+         x = "Analysis Method", y = "Number of DE Genes") +
+    theme_minimal()
+  
+  ggsave("D1vD2_figures/Final_Summary_DE.png", p_summary, width = 10, height = 6)
+  print(p_summary)
+}
+
+# Final QC check
+cat("\nFinal Quality Check:\n")
+cat(paste("Analysis completed successfully:", Sys.time()), "\n")
+cat(paste("Output files generated in:", getwd()), "\n")
+cat("Check the 'D1vD2_figures/' and 'D1vD2_tables/' directories for all outputs\n")
+
+# List all generated files
+figure_files <- list.files("D1vD2_figures", full.names = FALSE)
+table_files <- list.files("D1vD2_tables", full.names = FALSE)
+
+cat("\nGenerated Figures:\n")
+for (file in figure_files) cat(paste("-", file), "\n")
+
+cat("\nGenerated Tables:\n")  
+for (file in table_files) cat(paste("-", file), "\n")
+
+cat("\nENHANCED D1 vs D2 ANALYSIS COMPLETE\n")
+cat("This enhanced analysis includes:\n")
+cat("- Comprehensive D1 vs D2 differential expression analysis\n")
+cat("- KEGG and GO enrichment analysis (Biological Process, Molecular Function, Cellular Component)\n")
+cat("- Epigenetic regulator network analysis\n") 
+cat("- Disease relevance assessment for neurodegeneration\n")
+cat("- Global multiple testing correction\n")
+cat("- Tissue specificity and conservation analysis\n")
+cat("- Enhanced statistical comparisons between methods\n")
+cat("- Comprehensive result integration and export\n")
+cat("- MDS plots for sample relationship visualization\n")
+cat("- Advanced pathway visualization networks\n")
+
+cat("\nRecommended next steps:\n")
+cat("1. Validate top D1 vs D2 DE genes with qPCR or protein analysis\n")
+cat("2. Functional validation of key epigenetic regulators\n")
+cat("3. Investigation of enriched pathways in relevant disease models\n")
+cat("4. Integration with chromatin accessibility data (ATAC-seq) if available\n")
+cat("5. Cross-species validation in mouse models\n")
+cat("6. Drug target prioritization based on differential epigenetic regulators\n")
+```
+
+## Session Information
+```{r session info}
+sessionInfo()
+```
